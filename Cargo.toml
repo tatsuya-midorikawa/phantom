@@ -1,0 +1,22 @@
+[package]
+name = "phantom"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "A fast native text editor prototype for macOS and Windows."
+license = "MIT"
+
+[dependencies]
+eframe = "0.31"
+memchr = "2.7"
+memmap2 = "0.9"
+rfd = "0.15"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
