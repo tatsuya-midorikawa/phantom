@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -30,8 +31,10 @@ const SIDEBAR_PATH_MIN_WRAP_WIDTH: f32 = 48.0;
 const EDITOR_GUTTER_WIDTH: f32 = 72.0;
 const EDITOR_GUTTER_GAP: f32 = 10.0;
 const EDITOR_MIN_TEXT_WIDTH: f32 = 360.0;
+const EDITOR_MIN_WRAP_TEXT_WIDTH: f32 = 48.0;
 const EDITOR_MONOSPACE_CHAR_WIDTH: f32 = 9.0;
 const EDITOR_ROW_HEIGHT: f32 = 22.0;
+const WRAP_MEASURE_OVERSCAN_LINES: usize = 64;
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
@@ -89,7 +92,7 @@ impl SidebarView {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum ActiveDocument {
     Inline(EditorDocument),
     Large(Box<LargeDocument>),
@@ -174,6 +177,32 @@ enum LargeEditorAction {
     LoadLine(usize),
 }
 
+#[derive(Debug, Default)]
+struct WrapLineHeightCache {
+    extras: BTreeMap<usize, f32>,
+    measured_lines: BTreeSet<usize>,
+    text_width: Option<f32>,
+    line_range: Option<Range<usize>>,
+    scroll_anchor_line: Option<usize>,
+}
+
+impl WrapLineHeightCache {
+    fn clear(&mut self) {
+        self.extras.clear();
+        self.measured_lines.clear();
+        self.text_width = None;
+        self.line_range = None;
+        self.scroll_anchor_line = None;
+    }
+
+    fn invalidate_measurements(&mut self) {
+        self.extras.clear();
+        self.measured_lines.clear();
+        self.text_width = None;
+        self.line_range = None;
+    }
+}
+
 struct PhantomApp {
     document: ActiveDocument,
     path_input: String,
@@ -181,6 +210,7 @@ struct PhantomApp {
     active_view: SidebarView,
     sidebar_visible: bool,
     wrap_lines: bool,
+    wrap_line_heights: WrapLineHeightCache,
     open_receiver: Option<Receiver<OpenTaskResult>>,
     save_receiver: Option<Receiver<SaveTaskResult>>,
     viewport_receiver: Option<Receiver<ViewportTaskResult>>,
@@ -195,6 +225,7 @@ impl Default for PhantomApp {
             active_view: SidebarView::Explorer,
             sidebar_visible: true,
             wrap_lines: false,
+            wrap_line_heights: WrapLineHeightCache::default(),
             open_receiver: None,
             save_receiver: None,
             viewport_receiver: None,
@@ -285,6 +316,7 @@ impl PhantomApp {
                     .path()
                     .map(|path| path.display().to_string())
                     .unwrap_or_default();
+                self.wrap_line_heights.clear();
                 self.document = ActiveDocument::Inline(document);
                 self.message = AppMessage::Info("Opened".to_owned());
             }
@@ -296,6 +328,7 @@ impl PhantomApp {
                     document.viewport().end_byte(),
                     document.bytes()
                 ));
+                self.wrap_line_heights.clear();
                 self.document = ActiveDocument::Large(document);
             }
             OpenTaskResult::Failed { path, error } => {
@@ -667,9 +700,12 @@ impl PhantomApp {
                         });
                         None
                     }
-                    ActiveDocument::Large(document) => {
-                        show_large_virtual_editor(ui, document, self.wrap_lines)
-                    }
+                    ActiveDocument::Large(document) => show_large_virtual_editor(
+                        ui,
+                        document,
+                        self.wrap_lines,
+                        &mut self.wrap_line_heights,
+                    ),
                 };
 
                 if let Some(action) = large_editor_action {
@@ -735,6 +771,7 @@ impl PhantomApp {
         self.open_receiver = None;
         self.save_receiver = None;
         self.viewport_receiver = None;
+        self.wrap_line_heights.clear();
         self.document = ActiveDocument::default();
         self.path_input.clear();
         self.message = AppMessage::Info("New document".to_owned());
@@ -859,8 +896,17 @@ impl PhantomApp {
 
     fn apply_large_editor_action(&mut self, action: LargeEditorAction) {
         match action {
-            LargeEditorAction::Message(message) => self.message = message,
-            LargeEditorAction::LoadLine(line_index) => self.move_large_viewport_to_line(line_index),
+            LargeEditorAction::Message(message) => {
+                self.wrap_line_heights.invalidate_measurements();
+                self.message = message;
+            }
+            LargeEditorAction::LoadLine(line_index) => {
+                if self.wrap_lines {
+                    self.wrap_line_heights.scroll_anchor_line = Some(line_index);
+                }
+
+                self.move_large_viewport_to_line(line_index);
+            }
         }
     }
 
@@ -1015,6 +1061,7 @@ fn show_large_virtual_editor(
     ui: &mut egui::Ui,
     document: &mut LargeDocument,
     wrap_lines: bool,
+    wrap_line_heights: &mut WrapLineHeightCache,
 ) -> Option<LargeEditorAction> {
     ui.horizontal(|ui| {
         ui.add_space(12.0);
@@ -1045,21 +1092,38 @@ fn show_large_virtual_editor(
     let content_width =
         editor_content_width_for_text(document.viewport_text(), available_width, wrap_lines)
             .max(available_width);
-    let text_width = editor_text_width(content_width);
-    let row_height = editor_row_height(document.viewport_text(), text_width, wrap_lines);
+    let text_width = editor_text_width(content_width, wrap_lines);
     let line_count = document.file_line_count().max(1);
     let mut action = None;
-    let scroll_area = if wrap_lines {
-        egui::ScrollArea::vertical()
-    } else {
-        egui::ScrollArea::both()
-    };
 
-    scroll_area.auto_shrink([false, false]).show_rows(
-        ui,
-        row_height,
-        line_count,
-        |ui, row_range| {
+    if wrap_lines {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show_viewport(ui, |ui, viewport| {
+                show_wrapped_large_virtual_rows(
+                    ui,
+                    document,
+                    WrappedRowsGeometry {
+                        viewport,
+                        line_count,
+                        content_width,
+                        text_width,
+                    },
+                    WrappedRowsState {
+                        cache: wrap_line_heights,
+                        action: &mut action,
+                    },
+                );
+            });
+
+        return action;
+    }
+
+    let row_height = EDITOR_ROW_HEIGHT;
+
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show_rows(ui, row_height, line_count, |ui, row_range| {
             ui.set_min_width(content_width);
 
             if action.is_none() {
@@ -1092,10 +1156,263 @@ fn show_large_virtual_editor(
                     action = Some(LargeEditorAction::Message(line_message));
                 }
             }
-        },
-    );
+        });
 
     action
+}
+
+struct WrappedRowsGeometry {
+    viewport: egui::Rect,
+    line_count: usize,
+    content_width: f32,
+    text_width: f32,
+}
+
+struct WrappedRowsState<'a> {
+    cache: &'a mut WrapLineHeightCache,
+    action: &'a mut Option<LargeEditorAction>,
+}
+
+fn show_wrapped_large_virtual_rows(
+    ui: &mut egui::Ui,
+    document: &mut LargeDocument,
+    geometry: WrappedRowsGeometry,
+    state: WrappedRowsState<'_>,
+) {
+    reset_line_height_extras_if_layout_changed(
+        &mut state.cache.extras,
+        &mut state.cache.measured_lines,
+        &mut state.cache.text_width,
+        &mut state.cache.line_range,
+        geometry.text_width,
+        document.viewport_start_line()..document.viewport_end_line(),
+    );
+    let measurement_line_range =
+        wrapped_measurement_line_range(geometry.viewport, geometry.line_count, &state.cache.extras);
+
+    measure_wrapped_line_height_extras(
+        ui,
+        document,
+        geometry.text_width,
+        measurement_line_range,
+        &mut state.cache.extras,
+        &mut state.cache.measured_lines,
+    );
+
+    let total_height = virtual_editor_total_height(geometry.line_count, &state.cache.extras);
+
+    ui.set_height(total_height);
+    ui.set_min_width(geometry.content_width);
+
+    let anchored_this_frame = if let Some(anchor_line_index) = state.cache.scroll_anchor_line.take()
+    {
+        if anchor_line_index < geometry.line_count {
+            let anchor_top = virtual_line_top(anchor_line_index, &state.cache.extras);
+            let anchor_height = virtual_line_height(anchor_line_index, &state.cache.extras);
+            let anchor_rect = egui::Rect::from_min_size(
+                egui::pos2(ui.max_rect().left(), ui.max_rect().top() + anchor_top),
+                Vec2::new(geometry.content_width, anchor_height),
+            );
+
+            ui.scroll_to_rect(anchor_rect, Some(Align::Min));
+        }
+        true
+    } else {
+        false
+    };
+
+    let mut line_index = line_index_at_virtual_offset(
+        geometry.viewport.min.y,
+        geometry.line_count,
+        &state.cache.extras,
+    );
+
+    let mut line_top = virtual_line_top(line_index, &state.cache.extras);
+
+    while line_index < geometry.line_count {
+        if line_top > geometry.viewport.max.y {
+            break;
+        }
+
+        let line_height = virtual_line_height(line_index, &state.cache.extras);
+        let row_rect = egui::Rect::from_min_size(
+            egui::pos2(ui.max_rect().left(), ui.max_rect().top() + line_top),
+            Vec2::new(geometry.content_width, line_height),
+        );
+
+        with_positioned_row_ui(ui, row_rect, |row_ui| {
+            row_ui.set_min_width(geometry.content_width);
+
+            if !document.contains_file_line(line_index) {
+                if state.action.is_none() && !anchored_this_frame {
+                    *state.action = Some(LargeEditorAction::LoadLine(line_index));
+                }
+
+                show_loading_line(row_ui, line_index, line_height, geometry.text_width);
+            } else if let Some(line_message) = show_virtual_line(
+                row_ui,
+                document,
+                line_index,
+                line_height,
+                geometry.text_width,
+                true,
+            ) {
+                *state.action = Some(LargeEditorAction::Message(line_message));
+            }
+        });
+
+        line_top += line_height;
+        line_index += 1;
+    }
+}
+
+fn with_positioned_row_ui<R>(
+    ui: &mut egui::Ui,
+    row_rect: egui::Rect,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let mut row_ui = ui.new_child(egui::UiBuilder::new().max_rect(row_rect));
+
+    add_contents(&mut row_ui)
+}
+
+fn measure_wrapped_line_height_extras(
+    ui: &egui::Ui,
+    document: &LargeDocument,
+    text_width: f32,
+    line_range: Range<usize>,
+    line_height_extras: &mut BTreeMap<usize, f32>,
+    measured_lines: &mut BTreeSet<usize>,
+) {
+    for line_index in line_range {
+        if measured_lines.contains(&line_index) {
+            continue;
+        }
+
+        let Some(line_text) = document.file_line_text(line_index) else {
+            continue;
+        };
+        let line_height = editor_line_row_height_for_ui(ui, line_text, text_width);
+
+        update_line_height_extra(line_height_extras, line_index, line_height);
+        measured_lines.insert(line_index);
+    }
+}
+
+fn wrapped_measurement_line_range(
+    viewport: egui::Rect,
+    line_count: usize,
+    line_height_extras: &BTreeMap<usize, f32>,
+) -> Range<usize> {
+    let Some(last_line_index) = line_count.checked_sub(1) else {
+        return 0..0;
+    };
+    let start = line_index_at_virtual_offset(viewport.min.y, line_count, line_height_extras)
+        .saturating_sub(WRAP_MEASURE_OVERSCAN_LINES);
+    let end_line = line_index_at_virtual_offset(viewport.max.y, line_count, line_height_extras);
+    let end = end_line
+        .saturating_add(WRAP_MEASURE_OVERSCAN_LINES + 1)
+        .min(line_count)
+        .max((start + 1).min(last_line_index + 1));
+
+    start..end
+}
+
+fn reset_line_height_extras_if_layout_changed(
+    line_height_extras: &mut BTreeMap<usize, f32>,
+    measured_lines: &mut BTreeSet<usize>,
+    cached_text_width: &mut Option<f32>,
+    cached_line_range: &mut Option<Range<usize>>,
+    text_width: f32,
+    line_range: Range<usize>,
+) -> bool {
+    let width_changed = cached_text_width
+        .map(|cached_text_width| cached_text_width.round() != text_width.round())
+        .unwrap_or(true);
+    let range_changed = cached_line_range
+        .as_ref()
+        .map(|cached_line_range| cached_line_range != &line_range)
+        .unwrap_or(true);
+
+    if width_changed || range_changed {
+        line_height_extras.clear();
+        measured_lines.clear();
+        *cached_text_width = Some(text_width);
+        *cached_line_range = Some(line_range);
+
+        true
+    } else {
+        false
+    }
+}
+
+fn update_line_height_extra(
+    line_height_extras: &mut BTreeMap<usize, f32>,
+    line_index: usize,
+    line_height: f32,
+) {
+    let extra_height = line_height - EDITOR_ROW_HEIGHT;
+
+    if extra_height > 0.0 {
+        line_height_extras.insert(line_index, extra_height);
+    } else {
+        line_height_extras.remove(&line_index);
+    }
+}
+
+fn virtual_editor_total_height(
+    line_count: usize,
+    line_height_extras: &BTreeMap<usize, f32>,
+) -> f32 {
+    line_count as f32 * EDITOR_ROW_HEIGHT + line_height_extras.values().copied().sum::<f32>()
+}
+
+fn virtual_line_top(line_index: usize, line_height_extras: &BTreeMap<usize, f32>) -> f32 {
+    line_index as f32 * EDITOR_ROW_HEIGHT
+        + line_height_extras
+            .range(..line_index)
+            .map(|(_line_index, extra_height)| extra_height)
+            .copied()
+            .sum::<f32>()
+}
+
+fn virtual_line_height(line_index: usize, line_height_extras: &BTreeMap<usize, f32>) -> f32 {
+    EDITOR_ROW_HEIGHT + line_height_extras.get(&line_index).copied().unwrap_or(0.0)
+}
+
+fn line_index_at_virtual_offset(
+    offset_y: f32,
+    line_count: usize,
+    line_height_extras: &BTreeMap<usize, f32>,
+) -> usize {
+    let Some(last_line_index) = line_count.checked_sub(1) else {
+        return 0;
+    };
+
+    let offset_y = offset_y.max(0.0);
+    let mut accumulated_extra_height = 0.0;
+
+    for (line_index, extra_height) in line_height_extras {
+        let line_top = *line_index as f32 * EDITOR_ROW_HEIGHT + accumulated_extra_height;
+
+        if offset_y < line_top {
+            return (((offset_y - accumulated_extra_height).max(0.0) / EDITOR_ROW_HEIGHT).floor()
+                as usize)
+                .min(last_line_index);
+        }
+
+        let line_bottom = line_top + EDITOR_ROW_HEIGHT + *extra_height;
+
+        if offset_y < line_bottom {
+            return (*line_index).min(last_line_index);
+        }
+
+        accumulated_extra_height += *extra_height;
+    }
+
+    ((offset_y - accumulated_extra_height).max(0.0) / EDITOR_ROW_HEIGHT)
+        .floor()
+        .min(last_line_index as f32) as usize
 }
 
 fn first_missing_visible_line(
@@ -1112,8 +1429,8 @@ fn show_loading_line(ui: &mut egui::Ui, line_index: usize, row_height: f32, text
         let (line_number_rect, _) =
             ui.allocate_exact_size(Vec2::new(EDITOR_GUTTER_WIDTH, row_height), Sense::hover());
         ui.painter().text(
-            line_number_rect.right_center(),
-            Align2::RIGHT_CENTER,
+            line_number_top_pos(line_number_rect),
+            Align2::RIGHT_TOP,
             (line_index + 1).to_string(),
             FontId::new(12.0, FontFamily::Monospace),
             VSCODE_TEXT_DIM,
@@ -1140,8 +1457,8 @@ fn show_virtual_line(
         let (line_number_rect, _) =
             ui.allocate_exact_size(Vec2::new(EDITOR_GUTTER_WIDTH, row_height), Sense::hover());
         ui.painter().text(
-            line_number_rect.right_center(),
-            Align2::RIGHT_CENTER,
+            line_number_top_pos(line_number_rect),
+            Align2::RIGHT_TOP,
             (line_index + 1).to_string(),
             FontId::new(12.0, FontFamily::Monospace),
             VSCODE_TEXT_DIM,
@@ -1154,14 +1471,24 @@ fn show_virtual_line(
             .unwrap_or_default()
             .to_owned();
         let editable = document.is_file_line_editable(line_index);
+        let editor_id = ui.make_persistent_id(("large_line_editor", document.path(), line_index));
 
         let response = ui
             .add_enabled_ui(editable, |ui| {
-                add_line_editor(ui, &mut line_text, text_width, row_height, wrap_lines)
+                add_line_editor(
+                    ui,
+                    &mut line_text,
+                    text_width,
+                    row_height,
+                    wrap_lines,
+                    editor_id,
+                )
             })
             .inner;
 
         if editable && response.changed() {
+            remove_line_breaks(&mut line_text);
+
             message = match document.replace_file_line(line_index, &line_text) {
                 Ok(true) => Some(AppMessage::Info(format!("Edited line {}", line_index + 1))),
                 Ok(false) => None,
@@ -1171,6 +1498,14 @@ fn show_virtual_line(
     });
 
     message
+}
+
+fn line_number_top_pos(line_number_rect: egui::Rect) -> egui::Pos2 {
+    egui::pos2(line_number_rect.right(), line_number_rect.top() + 2.0)
+}
+
+fn remove_line_breaks(text: &mut String) {
+    text.retain(|character| character != '\n' && character != '\r');
 }
 
 fn sidebar_heading(ui: &mut egui::Ui, label: &str) {
@@ -1233,15 +1568,26 @@ fn editor_text_width_for_characters(character_count: usize) -> f32 {
         .ceil()
 }
 
-fn editor_text_width(content_width: f32) -> f32 {
-    (content_width - EDITOR_GUTTER_WIDTH - EDITOR_GUTTER_GAP).max(EDITOR_MIN_TEXT_WIDTH)
+fn editor_text_width(content_width: f32, wrap_lines: bool) -> f32 {
+    let minimum_width = if wrap_lines {
+        EDITOR_MIN_WRAP_TEXT_WIDTH
+    } else {
+        EDITOR_MIN_TEXT_WIDTH
+    };
+
+    (content_width - EDITOR_GUTTER_WIDTH - EDITOR_GUTTER_GAP).max(minimum_width)
 }
 
 fn editor_content_width_for_text(text: &str, available_width: f32, wrap_lines: bool) -> f32 {
-    let available_width = if available_width.is_finite() {
-        available_width.max(EDITOR_MIN_TEXT_WIDTH)
+    let minimum_width = if wrap_lines {
+        EDITOR_GUTTER_WIDTH + EDITOR_GUTTER_GAP + EDITOR_MIN_WRAP_TEXT_WIDTH
     } else {
         EDITOR_MIN_TEXT_WIDTH
+    };
+    let available_width = if available_width.is_finite() {
+        available_width.max(minimum_width)
+    } else {
+        minimum_width
     };
 
     if wrap_lines {
@@ -1253,29 +1599,35 @@ fn editor_content_width_for_text(text: &str, available_width: f32, wrap_lines: b
     (EDITOR_GUTTER_WIDTH + EDITOR_GUTTER_GAP + text_width).max(available_width)
 }
 
-fn wrapped_visual_rows(character_count: usize, text_width: f32) -> usize {
-    let columns = (text_width / EDITOR_MONOSPACE_CHAR_WIDTH).floor().max(1.0) as usize;
+fn editor_line_row_height_for_ui(ui: &egui::Ui, text: &str, text_width: f32) -> f32 {
+    let galley_height = ui.fonts(|fonts| {
+        fonts
+            .layout_job(editor_line_layout_job(text, text_width))
+            .size()
+            .y
+    });
 
-    character_count.div_ceil(columns).max(1)
+    galley_height.max(EDITOR_ROW_HEIGHT).ceil()
 }
 
-fn editor_row_height(text: &str, text_width: f32, wrap_lines: bool) -> f32 {
-    if !wrap_lines {
-        return EDITOR_ROW_HEIGHT;
-    }
+fn editor_line_layout_job(text: &str, wrap_width: f32) -> LayoutJob {
+    let mut layout_job = LayoutJob::single_section(
+        text.to_owned(),
+        TextFormat::simple(editor_font_id(), VSCODE_TEXT),
+    );
+    layout_job.wrap.max_width = wrap_width.max(EDITOR_MIN_WRAP_TEXT_WIDTH);
+    layout_job.wrap.break_anywhere = true;
 
-    let row_count = text
-        .lines()
-        .map(|line| wrapped_visual_rows(line.chars().count(), text_width))
-        .max()
-        .unwrap_or(1);
+    layout_job
+}
 
-    EDITOR_ROW_HEIGHT * row_count as f32
+fn editor_font_id() -> FontId {
+    FontId::new(14.0, FontFamily::Monospace)
 }
 
 fn editor_widget(text: &mut String, width: f32) -> TextEdit<'_> {
     TextEdit::multiline(text)
-        .font(FontId::new(14.0, FontFamily::Monospace))
+        .font(editor_font_id())
         .text_color(VSCODE_TEXT)
         .desired_width(width)
         .desired_rows(32)
@@ -1289,34 +1641,46 @@ fn add_line_editor(
     width: f32,
     height: f32,
     wrap_lines: bool,
+    id: egui::Id,
 ) -> egui::Response {
     if wrap_lines {
         let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
-            let mut layout_job = LayoutJob::single_section(
-                text.to_owned(),
-                TextFormat::simple(FontId::new(14.0, FontFamily::Monospace), VSCODE_TEXT),
-            );
-            layout_job.wrap.max_width = wrap_width.max(EDITOR_MIN_TEXT_WIDTH);
-            layout_job.wrap.break_anywhere = true;
-
-            ui.fonts(|fonts| fonts.layout_job(layout_job))
+            ui.fonts(|fonts| fonts.layout_job(editor_line_layout_job(text, wrap_width)))
         };
 
         return ui.add_sized(
             Vec2::new(width, height),
-            line_editor_widget(text, width).layouter(&mut layouter),
+            wrapped_line_editor_widget(text, width, id).layouter(&mut layouter),
         );
     }
 
-    ui.add_sized(Vec2::new(width, height), line_editor_widget(text, width))
+    ui.add_sized(
+        Vec2::new(width, height),
+        line_editor_widget(text, width, id),
+    )
 }
 
-fn line_editor_widget(text: &mut String, width: f32) -> TextEdit<'_> {
+fn wrapped_line_editor_widget(text: &mut String, width: f32, id: egui::Id) -> TextEdit<'_> {
+    TextEdit::multiline(text)
+        .id(id)
+        .font(editor_font_id())
+        .text_color(VSCODE_TEXT)
+        .desired_width(width)
+        .desired_rows(1)
+        .return_key(None)
+        .lock_focus(true)
+        .margin(Margin::ZERO)
+        .frame(false)
+}
+
+fn line_editor_widget(text: &mut String, width: f32, id: egui::Id) -> TextEdit<'_> {
     TextEdit::singleline(text)
-        .font(FontId::new(14.0, FontFamily::Monospace))
+        .id(id)
+        .font(editor_font_id())
         .text_color(VSCODE_TEXT)
         .desired_width(width)
         .clip_text(false)
+        .margin(Margin::ZERO)
         .frame(false)
 }
 
@@ -1494,19 +1858,214 @@ mod tests {
     }
 
     #[test]
-    fn editor_row_height_grows_for_wrapped_long_lines() {
-        let long_line = "x".repeat(120);
+    fn editor_text_width_uses_wrap_minimum_in_wrap_mode() {
+        let content_width = EDITOR_GUTTER_WIDTH + EDITOR_GUTTER_GAP + 120.0;
+
+        assert_eq!(editor_text_width(content_width, true), 120.0);
+        assert_eq!(
+            editor_content_width_for_text("x", 10.0, true),
+            EDITOR_GUTTER_WIDTH + EDITOR_GUTTER_GAP + EDITOR_MIN_WRAP_TEXT_WIDTH
+        );
+    }
+
+    #[test]
+    fn editor_line_layout_job_wraps_at_requested_text_width() {
+        let layout_job = editor_line_layout_job("abcdef", 123.0);
+
+        assert_eq!(layout_job.wrap.max_width, 123.0);
+        assert!(layout_job.wrap.break_anywhere);
+    }
+
+    #[test]
+    fn editor_line_row_height_uses_actual_galley_height_for_long_wrapped_lines() {
+        let long_json_line = format!(r#"{{"line":78218,"payload":"{}"}}"#, "x".repeat(2_000));
         let text_width = EDITOR_MONOSPACE_CHAR_WIDTH * 40.0;
 
-        assert_eq!(wrapped_visual_rows(long_line.len(), text_width), 3);
+        egui::__run_test_ui(|ui| {
+            let expected_height = ui.fonts(|fonts| {
+                fonts
+                    .layout_job(editor_line_layout_job(&long_json_line, text_width))
+                    .size()
+                    .y
+                    .max(EDITOR_ROW_HEIGHT)
+                    .ceil()
+            });
+            let measured_height = editor_line_row_height_for_ui(ui, &long_json_line, text_width);
+
+            assert_eq!(measured_height, expected_height);
+        });
+    }
+
+    #[test]
+    fn wrapped_measurement_line_range_uses_visible_rows_with_overscan() {
+        let viewport = egui::Rect::from_min_max(
+            egui::pos2(0.0, EDITOR_ROW_HEIGHT * 500.0),
+            egui::pos2(200.0, EDITOR_ROW_HEIGHT * 510.0),
+        );
+
+        let range = wrapped_measurement_line_range(viewport, 10_000, &BTreeMap::new());
+
+        assert_eq!(range.start, 500 - WRAP_MEASURE_OVERSCAN_LINES);
+        assert_eq!(range.end, 510 + WRAP_MEASURE_OVERSCAN_LINES + 1);
+    }
+
+    #[test]
+    fn virtual_line_positions_include_only_known_wrapped_extras() {
+        let line_height_extras = BTreeMap::from([(2, EDITOR_ROW_HEIGHT * 2.0)]);
+
         assert_eq!(
-            editor_row_height(&long_line, text_width, true),
+            virtual_editor_total_height(5, &line_height_extras),
+            EDITOR_ROW_HEIGHT * 7.0
+        );
+        assert_eq!(virtual_line_top(1, &line_height_extras), EDITOR_ROW_HEIGHT);
+        assert_eq!(
+            virtual_line_top(3, &line_height_extras),
+            EDITOR_ROW_HEIGHT * 5.0
+        );
+        assert_eq!(
+            virtual_line_height(2, &line_height_extras),
             EDITOR_ROW_HEIGHT * 3.0
         );
         assert_eq!(
-            editor_row_height(&long_line, text_width, false),
+            virtual_line_height(3, &line_height_extras),
             EDITOR_ROW_HEIGHT
         );
+    }
+
+    #[test]
+    fn line_index_at_virtual_offset_accounts_for_wrapped_line_height() {
+        let line_height_extras = BTreeMap::from([(2, EDITOR_ROW_HEIGHT * 2.0)]);
+
+        assert_eq!(
+            line_index_at_virtual_offset(EDITOR_ROW_HEIGHT * 2.5, 5, &line_height_extras),
+            2
+        );
+        assert_eq!(
+            line_index_at_virtual_offset(EDITOR_ROW_HEIGHT * 5.1, 5, &line_height_extras),
+            3
+        );
+        assert_eq!(
+            line_index_at_virtual_offset(9_999.0, 5, &line_height_extras),
+            4
+        );
+    }
+
+    #[test]
+    fn positioned_row_ui_does_not_advance_parent_layout() {
+        egui::__run_test_ui(|ui| {
+            ui.set_height(100.0);
+            let parent_min_rect = ui.min_rect();
+            let row_rect = egui::Rect::from_min_size(
+                egui::pos2(ui.max_rect().left(), ui.max_rect().top() + 40.0),
+                Vec2::new(200.0, 80.0),
+            );
+
+            with_positioned_row_ui(ui, row_rect, |row_ui| {
+                row_ui.allocate_exact_size(Vec2::new(200.0, 80.0), Sense::hover());
+            });
+
+            assert_eq!(ui.min_rect(), parent_min_rect);
+        });
+    }
+
+    #[test]
+    fn update_line_height_extra_removes_short_lines_from_cache() {
+        let mut line_height_extras = BTreeMap::new();
+
+        update_line_height_extra(&mut line_height_extras, 7, EDITOR_ROW_HEIGHT * 3.0);
+        assert_eq!(line_height_extras.get(&7), Some(&(EDITOR_ROW_HEIGHT * 2.0)));
+
+        update_line_height_extra(&mut line_height_extras, 7, EDITOR_ROW_HEIGHT);
+        assert!(!line_height_extras.contains_key(&7));
+    }
+
+    #[test]
+    fn line_number_position_uses_row_top() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), Vec2::new(72.0, 88.0));
+
+        assert_eq!(line_number_top_pos(rect), egui::pos2(82.0, 22.0));
+    }
+
+    #[test]
+    fn remove_line_breaks_keeps_large_line_edits_single_line() {
+        let mut text = "alpha\r\nbeta\ngamma".to_owned();
+
+        remove_line_breaks(&mut text);
+
+        assert_eq!(text, "alphabetagamma");
+    }
+
+    #[test]
+    fn reset_line_height_extras_clears_cache_when_wrap_width_changes() {
+        let mut line_height_extras = BTreeMap::from([(7, EDITOR_ROW_HEIGHT * 2.0)]);
+        let mut measured_lines = BTreeSet::from([7]);
+        let mut cached_text_width = Some(320.0);
+        let mut cached_line_range = Some(0..10);
+
+        assert!(!reset_line_height_extras_if_layout_changed(
+            &mut line_height_extras,
+            &mut measured_lines,
+            &mut cached_text_width,
+            &mut cached_line_range,
+            320.25,
+            0..10,
+        ));
+        assert!(line_height_extras.contains_key(&7));
+        assert!(measured_lines.contains(&7));
+
+        assert!(reset_line_height_extras_if_layout_changed(
+            &mut line_height_extras,
+            &mut measured_lines,
+            &mut cached_text_width,
+            &mut cached_line_range,
+            340.0,
+            0..10,
+        ));
+        assert!(line_height_extras.is_empty());
+        assert!(measured_lines.is_empty());
+        assert_eq!(cached_text_width, Some(340.0));
+        assert_eq!(cached_line_range, Some(0..10));
+    }
+
+    #[test]
+    fn reset_line_height_extras_clears_cache_when_rounded_wrap_width_changes() {
+        let mut line_height_extras = BTreeMap::from([(7, EDITOR_ROW_HEIGHT * 2.0)]);
+        let mut measured_lines = BTreeSet::from([7]);
+        let mut cached_text_width = Some(320.4);
+        let mut cached_line_range = Some(0..10);
+
+        assert!(reset_line_height_extras_if_layout_changed(
+            &mut line_height_extras,
+            &mut measured_lines,
+            &mut cached_text_width,
+            &mut cached_line_range,
+            320.6,
+            0..10,
+        ));
+
+        assert!(line_height_extras.is_empty());
+        assert!(measured_lines.is_empty());
+    }
+
+    #[test]
+    fn reset_line_height_extras_clears_cache_when_viewport_range_changes() {
+        let mut line_height_extras = BTreeMap::from([(7, EDITOR_ROW_HEIGHT * 2.0)]);
+        let mut measured_lines = BTreeSet::from([7]);
+        let mut cached_text_width = Some(320.0);
+        let mut cached_line_range = Some(0..10);
+
+        assert!(reset_line_height_extras_if_layout_changed(
+            &mut line_height_extras,
+            &mut measured_lines,
+            &mut cached_text_width,
+            &mut cached_line_range,
+            320.0,
+            10..20,
+        ));
+
+        assert!(line_height_extras.is_empty());
+        assert!(measured_lines.is_empty());
+        assert_eq!(cached_line_range, Some(10..20));
     }
 
     #[test]
