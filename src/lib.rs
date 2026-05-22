@@ -1,11 +1,14 @@
 use memchr::memchr_iter;
 use memmap2::MmapOptions;
+use std::borrow::Cow;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub mod search;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -22,6 +25,49 @@ pub struct TextMetrics {
     pub bytes: usize,
     pub characters: usize,
     pub visual_lines: usize,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum TextEncoding {
+    Utf8,
+    Utf8Bom,
+}
+
+impl TextEncoding {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            TextEncoding::Utf8 => "UTF-8",
+            TextEncoding::Utf8Bom => "UTF-8 BOM",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum LineEnding {
+    Lf,
+    Crlf,
+    Cr,
+}
+
+impl LineEnding {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LineEnding::Lf => "\n",
+            LineEnding::Crlf => "\r\n",
+            LineEnding::Cr => "\r",
+        }
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            LineEnding::Lf => "LF",
+            LineEnding::Crlf => "CRLF",
+            LineEnding::Cr => "CR",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -56,6 +102,8 @@ pub struct EditorDocument {
     path: Option<PathBuf>,
     dirty: bool,
     metrics: TextMetrics,
+    encoding: TextEncoding,
+    line_ending: LineEnding,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -948,18 +996,32 @@ impl EditorDocument {
             path: None,
             dirty: false,
             metrics: calculate_text_metrics(""),
+            encoding: TextEncoding::Utf8,
+            line_ending: LineEnding::Lf,
         }
     }
 
     #[must_use]
     pub fn from_saved_text(path: PathBuf, text: String) -> Self {
+        Self::from_saved_text_with_format(path, text, TextEncoding::Utf8)
+    }
+
+    #[must_use]
+    pub fn from_saved_text_with_format(
+        path: PathBuf,
+        text: String,
+        encoding: TextEncoding,
+    ) -> Self {
         let metrics = calculate_text_metrics(&text);
+        let line_ending = detect_line_ending(&text).unwrap_or(LineEnding::Lf);
 
         Self {
             text,
             path: Some(path),
             dirty: false,
             metrics,
+            encoding,
+            line_ending,
         }
     }
 
@@ -1001,6 +1063,38 @@ impl EditorDocument {
     pub fn mark_saved_as(&mut self, path: PathBuf) {
         self.path = Some(path);
         self.dirty = false;
+    }
+
+    #[must_use]
+    pub fn encoding(&self) -> TextEncoding {
+        self.encoding
+    }
+
+    #[must_use]
+    pub fn line_ending(&self) -> LineEnding {
+        self.line_ending
+    }
+
+    #[must_use]
+    fn encoded_text_for_save(&self) -> Cow<'_, [u8]> {
+        let normalized = normalize_line_endings(&self.text, self.line_ending);
+        let bytes = match normalized {
+            Cow::Borrowed(text) if self.encoding == TextEncoding::Utf8 => {
+                return Cow::Borrowed(text.as_bytes());
+            }
+            Cow::Borrowed(text) => text.as_bytes().to_vec(),
+            Cow::Owned(text) => text.into_bytes(),
+        };
+
+        if self.encoding == TextEncoding::Utf8Bom {
+            let mut encoded = Vec::with_capacity(3 + bytes.len());
+            encoded.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+            encoded.extend_from_slice(&bytes);
+
+            Cow::Owned(encoded)
+        } else {
+            Cow::Owned(bytes)
+        }
     }
 
     #[must_use]
@@ -1048,6 +1142,60 @@ pub fn calculate_text_metrics(text: &str) -> TextMetrics {
 #[must_use]
 pub fn count_visual_lines(text: &str) -> usize {
     memchr_iter(b'\n', text.as_bytes()).count() + 1
+}
+
+#[must_use]
+pub fn detect_line_ending(text: &str) -> Option<LineEnding> {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' if bytes.get(index + 1) == Some(&b'\n') => return Some(LineEnding::Crlf),
+            b'\r' => return Some(LineEnding::Cr),
+            b'\n' => return Some(LineEnding::Lf),
+            _ => index += 1,
+        }
+    }
+
+    None
+}
+
+#[must_use]
+pub fn normalize_line_endings(text: &str, line_ending: LineEnding) -> Cow<'_, str> {
+    if line_ending == LineEnding::Lf && !text.as_bytes().contains(&b'\r') {
+        return Cow::Borrowed(text);
+    }
+
+    let mut normalized = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    let mut index = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' => {
+                normalized.push_str(&text[start..index]);
+                normalized.push_str(line_ending.as_str());
+                index += usize::from(bytes.get(index + 1) == Some(&b'\n')) + 1;
+                start = index;
+            }
+            b'\n' => {
+                normalized.push_str(&text[start..index]);
+                normalized.push_str(line_ending.as_str());
+                index += 1;
+                start = index;
+            }
+            _ => index += 1,
+        }
+    }
+
+    if start == 0 {
+        Cow::Borrowed(text)
+    } else {
+        normalized.push_str(&text[start..]);
+        Cow::Owned(normalized)
+    }
 }
 
 #[must_use]
@@ -1141,9 +1289,13 @@ pub fn load_document_with_limit(
         ));
     }
 
-    let text = read_mapped_utf8(&file)?;
+    let (text, encoding) = read_mapped_text(&file)?;
 
-    Ok(EditorDocument::from_saved_text(document_path, text))
+    Ok(EditorDocument::from_saved_text_with_format(
+        document_path,
+        text,
+        encoding,
+    ))
 }
 
 pub fn open_large_document(path: impl AsRef<Path>) -> io::Result<LargeDocument> {
@@ -1228,7 +1380,9 @@ pub fn read_large_viewport(
 pub fn save_document(document: &mut EditorDocument, path: impl AsRef<Path>) -> io::Result<()> {
     let document_path = path.as_ref().to_path_buf();
 
-    atomic_write(&document_path, document.text().as_bytes())?;
+    let encoded_text = document.encoded_text_for_save();
+
+    atomic_write(&document_path, encoded_text.as_ref())?;
     document.mark_saved_as(document_path);
 
     Ok(())
@@ -1282,16 +1436,26 @@ fn ensure_file_fingerprint_matches(path: &Path, expected: &FileFingerprint) -> i
     }
 }
 
-fn read_mapped_utf8(file: &File) -> io::Result<String> {
+fn read_mapped_text(file: &File) -> io::Result<(String, TextEncoding)> {
     if file.metadata()?.len() == 0 {
-        return Ok(String::new());
+        return Ok((String::new(), TextEncoding::Utf8));
     }
 
     let mapped_file = map_file(file)?;
+    let (bytes, encoding) = decode_utf8_bytes(&mapped_file);
 
-    std::str::from_utf8(&mapped_file)
+    std::str::from_utf8(bytes)
         .map(str::to_owned)
+        .map(|text| (text, encoding))
         .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))
+}
+
+fn decode_utf8_bytes(bytes: &[u8]) -> (&[u8], TextEncoding) {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        (&bytes[3..], TextEncoding::Utf8Bom)
+    } else {
+        (bytes, TextEncoding::Utf8)
+    }
 }
 
 fn map_file(file: &File) -> io::Result<memmap2::Mmap> {
@@ -1594,6 +1758,49 @@ mod tests {
         assert_eq!(metrics.bytes, 12);
         assert_eq!(metrics.characters, 8);
         assert_eq!(metrics.visual_lines, 2);
+    }
+
+    #[test]
+    fn detects_first_line_ending_style() {
+        assert_eq!(detect_line_ending("a\r\nb"), Some(LineEnding::Crlf));
+        assert_eq!(detect_line_ending("a\rb"), Some(LineEnding::Cr));
+        assert_eq!(detect_line_ending("a\nb"), Some(LineEnding::Lf));
+        assert_eq!(detect_line_ending("single line"), None);
+    }
+
+    #[test]
+    fn normalizes_line_endings_to_document_style() {
+        let normalized = normalize_line_endings("a\nb\r\nc\r", LineEnding::Crlf);
+
+        assert_eq!(normalized.as_ref(), "a\r\nb\r\nc\r\n");
+    }
+
+    #[test]
+    fn strips_utf8_bom_from_loaded_text_and_preserves_it_on_save() -> io::Result<()> {
+        let path = unique_temp_path("utf8_bom.txt");
+        fs::write(&path, [0xEF, 0xBB, 0xBF, b'a', b'\r', b'\n', b'b'])?;
+
+        let mut document = load_document(&path)?;
+
+        assert_eq!(document.text(), "a\r\nb");
+        assert_eq!(document.encoding(), TextEncoding::Utf8Bom);
+        assert_eq!(document.line_ending(), LineEnding::Crlf);
+
+        document.replace_text("x\ny".to_owned());
+        save_document(&mut document, &path)?;
+
+        assert_eq!(
+            fs::read(&path)?,
+            [0xEF, 0xBB, 0xBF, b'x', b'\r', b'\n', b'y']
+        );
+        let reloaded_document = load_document(&path)?;
+
+        assert_eq!(reloaded_document.text(), "x\r\ny");
+        assert_eq!(reloaded_document.encoding(), TextEncoding::Utf8Bom);
+        assert_eq!(reloaded_document.line_ending(), LineEnding::Crlf);
+
+        fs::remove_file(path)?;
+        Ok(())
     }
 
     #[test]

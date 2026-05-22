@@ -30,9 +30,11 @@ cargo test
 - Create a new empty document.
 - Edit text in a native desktop window.
 - Open a UTF-8 text file with a native file selection dialog.
+- Preserve UTF-8 BOM and detected line-ending style for inline documents.
 - Open large files asynchronously without loading the whole file into memory.
 - Scroll across every indexed line in a large file instead of stopping at the first viewport.
 - Horizontally scroll long editor lines, with an optional wrap mode from the View menu.
+- Search with match-case, whole-word, and regular-expression options; Replace All is available for inline documents.
 - Edit and save the visible window of a large file with piece-table edits.
 - Render large-file viewports with virtual rows backed by a chunked line index.
 - Move between large-file windows in a background worker.

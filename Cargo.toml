@@ -10,6 +10,7 @@ license = "MIT"
 eframe = "0.31"
 memchr = "2.7"
 memmap2 = "0.9"
+regex = "1.10"
 rfd = "0.15"
 
 [target.'cfg(windows)'.dependencies]

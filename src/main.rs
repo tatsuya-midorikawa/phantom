@@ -10,8 +10,9 @@ use eframe::egui::{
     Margin, RichText, Sense, Stroke, TextEdit, TextFormat, Vec2,
 };
 use phantom::{
-    open_text_document, save_document, save_large_document, EditorDocument, LargeDocument,
-    OpenedDocument,
+    open_text_document, save_document, save_large_document,
+    search::{find_text_matches, line_preview, replace_all as search_replace_all, SearchOptions},
+    EditorDocument, LargeDocument, OpenedDocument,
 };
 use rfd::FileDialog;
 
@@ -35,6 +36,7 @@ const EDITOR_MIN_WRAP_TEXT_WIDTH: f32 = 48.0;
 const EDITOR_MONOSPACE_CHAR_WIDTH: f32 = 9.0;
 const EDITOR_ROW_HEIGHT: f32 = 22.0;
 const WRAP_MEASURE_OVERSCAN_LINES: usize = 64;
+const SEARCH_RESULT_LIMIT: usize = 200;
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
@@ -203,6 +205,34 @@ impl WrapLineHeightCache {
     }
 }
 
+#[derive(Debug, Default)]
+struct SearchPanelState {
+    query: String,
+    replacement: String,
+    match_case: bool,
+    whole_word: bool,
+    use_regex: bool,
+    results: Vec<SearchResultRow>,
+    error: Option<String>,
+    searched_scope: Option<&'static str>,
+}
+
+impl SearchPanelState {
+    fn options(&self) -> SearchOptions {
+        SearchOptions {
+            match_case: self.match_case,
+            whole_word: self.whole_word,
+            use_regex: self.use_regex,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct SearchResultRow {
+    line_number: usize,
+    preview: String,
+}
+
 struct PhantomApp {
     document: ActiveDocument,
     path_input: String,
@@ -211,6 +241,7 @@ struct PhantomApp {
     sidebar_visible: bool,
     wrap_lines: bool,
     wrap_line_heights: WrapLineHeightCache,
+    search: SearchPanelState,
     open_receiver: Option<Receiver<OpenTaskResult>>,
     save_receiver: Option<Receiver<SaveTaskResult>>,
     viewport_receiver: Option<Receiver<ViewportTaskResult>>,
@@ -226,6 +257,7 @@ impl Default for PhantomApp {
             sidebar_visible: true,
             wrap_lines: false,
             wrap_line_heights: WrapLineHeightCache::default(),
+            search: SearchPanelState::default(),
             open_receiver: None,
             save_receiver: None,
             viewport_receiver: None,
@@ -501,7 +533,7 @@ impl PhantomApp {
 
                 match self.active_view {
                     SidebarView::Explorer => self.show_explorer(ui),
-                    SidebarView::Search => self.show_search_placeholder(ui),
+                    SidebarView::Search => self.show_search(ui),
                     SidebarView::Outline => self.show_outline(ui),
                 }
             });
@@ -565,15 +597,162 @@ impl PhantomApp {
         }
     }
 
-    fn show_search_placeholder(&mut self, ui: &mut egui::Ui) {
+    fn show_search(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.add_space(12.0);
-            ui.label(
-                RichText::new("Search indexing runs outside the editor thread.")
-                    .color(VSCODE_TEXT_DIM),
-            );
+            ui.vertical(|ui| {
+                let query_response = ui.add(
+                    TextEdit::singleline(&mut self.search.query)
+                        .hint_text("Search")
+                        .desired_width(ui.available_width()),
+                );
+                let enter_pressed = ui.input(|input| input.key_pressed(egui::Key::Enter));
+
+                ui.add_space(4.0);
+                ui.add(
+                    TextEdit::singleline(&mut self.search.replacement)
+                        .hint_text("Replace")
+                        .desired_width(ui.available_width()),
+                );
+
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut self.search.match_case, "Match Case");
+                    ui.checkbox(&mut self.search.whole_word, "Whole Word");
+                    ui.checkbox(&mut self.search.use_regex, "Regex");
+                });
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Find").clicked() || (query_response.lost_focus() && enter_pressed)
+                    {
+                        self.run_search();
+                    }
+
+                    let replace_enabled = matches!(self.document, ActiveDocument::Inline(_));
+
+                    if ui
+                        .add_enabled(replace_enabled, egui::Button::new("Replace All"))
+                        .clicked()
+                    {
+                        self.replace_all_inline_matches();
+                    }
+                });
+
+                ui.add_space(10.0);
+                self.show_search_results(ui);
+            });
         });
+    }
+
+    fn show_search_results(&self, ui: &mut egui::Ui) {
+        if let Some(error) = &self.search.error {
+            ui.label(RichText::new(error).color(VSCODE_STATUS_ERROR));
+            return;
+        }
+
+        let scope = self.search.searched_scope.unwrap_or("document");
+        ui.label(
+            RichText::new(format!(
+                "{} result{} in {scope}",
+                self.search.results.len(),
+                if self.search.results.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ))
+            .color(VSCODE_TEXT_DIM),
+        );
+        ui.add_space(6.0);
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for result in &self.search.results {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("{}", result.line_number))
+                                .color(VSCODE_TEXT_DIM)
+                                .monospace(),
+                        );
+                        ui.label(RichText::new(&result.preview).color(VSCODE_TEXT));
+                    });
+                    ui.add_space(3.0);
+                }
+            });
+    }
+
+    fn run_search(&mut self) {
+        let query = self.search.query.clone();
+        let options = self.search.options();
+        let (scope, base_line, text) = match &self.document {
+            ActiveDocument::Inline(document) => ("document", 0, document.text()),
+            ActiveDocument::Large(document) => (
+                "current viewport",
+                document.viewport_start_line(),
+                document.viewport_text(),
+            ),
+        };
+
+        match find_text_matches(text, &query, options, SEARCH_RESULT_LIMIT) {
+            Ok(matches) => {
+                self.search.results = matches
+                    .into_iter()
+                    .map(|search_match| SearchResultRow {
+                        line_number: base_line + search_match.line_index + 1,
+                        preview: line_preview(text, search_match.range.start),
+                    })
+                    .collect();
+                self.search.error = None;
+                self.search.searched_scope = Some(scope);
+                self.message = AppMessage::Info(format!(
+                    "Found {} result{}",
+                    self.search.results.len(),
+                    if self.search.results.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ));
+            }
+            Err(error) => {
+                self.search.results.clear();
+                self.search.error = Some(error.to_string());
+                self.search.searched_scope = Some(scope);
+                self.message = AppMessage::Error(format!("Search failed: {error}"));
+            }
+        }
+    }
+
+    fn replace_all_inline_matches(&mut self) {
+        let ActiveDocument::Inline(document) = &mut self.document else {
+            self.message =
+                AppMessage::Error("Replace All is available for inline documents".to_owned());
+            return;
+        };
+        let query = self.search.query.clone();
+        let replacement = self.search.replacement.clone();
+        let options = self.search.options();
+
+        match search_replace_all(document.text(), &query, &replacement, options) {
+            Ok((text, count)) => {
+                if count > 0 {
+                    document.replace_text(text);
+                }
+
+                self.message = AppMessage::Info(format!(
+                    "Replaced {count} match{}",
+                    if count == 1 { "" } else { "es" }
+                ));
+                self.run_search();
+            }
+            Err(error) => {
+                self.search.error = Some(error.to_string());
+                self.message = AppMessage::Error(format!("Replace failed: {error}"));
+            }
+        }
     }
 
     fn show_outline(&mut self, ui: &mut egui::Ui) {
@@ -598,6 +777,8 @@ impl PhantomApp {
                 let metrics = document.metrics();
                 vec![
                     ("Mode", self.document.mode_label().to_owned()),
+                    ("Encoding", document.encoding().label().to_owned()),
+                    ("Line endings", document.line_ending().label().to_owned()),
                     ("Lines", metrics.visual_lines.to_string()),
                     ("Characters", metrics.characters.to_string()),
                     ("Bytes", metrics.bytes.to_string()),
