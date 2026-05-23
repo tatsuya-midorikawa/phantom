@@ -6,8 +6,11 @@ use std::thread;
 use std::time::Duration;
 
 use eframe::egui::{
-    self, text::LayoutJob, Align, Align2, Color32, CornerRadius, FontFamily, FontId, Frame, Layout,
-    Margin, RichText, Sense, Stroke, TextEdit, TextFormat, Vec2,
+    self,
+    text::{CCursor, CCursorRange, LayoutJob},
+    widgets::text_edit::TextEditState,
+    Align, Align2, Color32, CornerRadius, FontFamily, FontId, Frame, KeyboardShortcut, Layout,
+    Margin, Modifiers, RichText, Sense, Stroke, TextEdit, TextFormat, Vec2,
 };
 use phantom::{
     open_text_document, save_document, save_large_document,
@@ -35,6 +38,10 @@ const EDITOR_MIN_TEXT_WIDTH: f32 = 360.0;
 const EDITOR_MIN_WRAP_TEXT_WIDTH: f32 = 48.0;
 const EDITOR_MONOSPACE_CHAR_WIDTH: f32 = 9.0;
 const EDITOR_ROW_HEIGHT: f32 = 22.0;
+const DEFAULT_EDITOR_FONT_SIZE: f32 = 14.0;
+const MIN_EDITOR_FONT_SIZE: f32 = 10.0;
+const MAX_EDITOR_FONT_SIZE: f32 = 32.0;
+const INLINE_EDITOR_ID_SOURCE: &str = "inline_editor";
 const WRAP_MEASURE_OVERSCAN_LINES: usize = 64;
 const SEARCH_RESULT_LIMIT: usize = 200;
 
@@ -233,6 +240,30 @@ struct SearchResultRow {
     preview: String,
 }
 
+#[derive(Debug, Default)]
+struct GoToLineState {
+    visible: bool,
+    input: String,
+    error: Option<String>,
+    request_focus: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShortcutAction {
+    New,
+    Open,
+    Save,
+    SaveAs,
+    Search,
+    GoToLine,
+    RunSearch,
+    ToggleWrap,
+    ToggleHelp,
+    ZoomIn,
+    ZoomOut,
+    ResetZoom,
+}
+
 struct PhantomApp {
     document: ActiveDocument,
     path_input: String,
@@ -242,6 +273,10 @@ struct PhantomApp {
     wrap_lines: bool,
     wrap_line_heights: WrapLineHeightCache,
     search: SearchPanelState,
+    go_to_line: GoToLineState,
+    show_help: bool,
+    editor_font_size: f32,
+    pending_inline_cursor: Option<usize>,
     open_receiver: Option<Receiver<OpenTaskResult>>,
     save_receiver: Option<Receiver<SaveTaskResult>>,
     viewport_receiver: Option<Receiver<ViewportTaskResult>>,
@@ -258,6 +293,10 @@ impl Default for PhantomApp {
             wrap_lines: false,
             wrap_line_heights: WrapLineHeightCache::default(),
             search: SearchPanelState::default(),
+            go_to_line: GoToLineState::default(),
+            show_help: false,
+            editor_font_size: DEFAULT_EDITOR_FONT_SIZE,
+            pending_inline_cursor: None,
             open_receiver: None,
             save_receiver: None,
             viewport_receiver: None,
@@ -271,6 +310,8 @@ impl eframe::App for PhantomApp {
         self.poll_background_save(context);
         self.poll_background_viewport(context);
         self.guard_close_request(context);
+        self.handle_dropped_files(context);
+        self.handle_keyboard_shortcuts(context);
         context.send_viewport_cmd(egui::ViewportCommand::Title(self.document.window_title()));
 
         self.show_menu_bar(context);
@@ -283,6 +324,8 @@ impl eframe::App for PhantomApp {
 
         self.show_tab_bar(context);
         self.show_editor(context);
+        self.show_go_to_line_window(context);
+        self.show_help_window(context);
     }
 }
 
@@ -400,6 +443,128 @@ impl PhantomApp {
         }
     }
 
+    fn handle_dropped_files(&mut self, context: &egui::Context) {
+        let dropped_path = context.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .find_map(|file| file.path.clone())
+        });
+
+        if let Some(path) = dropped_path {
+            if self.can_replace_document("opening a dropped file") {
+                self.open_document_at(path);
+            }
+        }
+    }
+
+    fn handle_keyboard_shortcuts(&mut self, context: &egui::Context) {
+        for action in collect_shortcut_actions(context) {
+            self.apply_shortcut_action(action, context);
+        }
+    }
+
+    fn apply_shortcut_action(&mut self, action: ShortcutAction, context: &egui::Context) {
+        match action {
+            ShortcutAction::New => self.new_document(),
+            ShortcutAction::Open => self.open_document_with_dialog(),
+            ShortcutAction::Save => self.save_document(),
+            ShortcutAction::SaveAs => self.save_document_with_dialog(),
+            ShortcutAction::Search => self.open_search_panel(),
+            ShortcutAction::GoToLine => self.open_go_to_line(),
+            ShortcutAction::RunSearch => {
+                if self.search.query.is_empty() {
+                    self.open_search_panel();
+                } else {
+                    self.run_search();
+                }
+            }
+            ShortcutAction::ToggleWrap => {
+                self.wrap_lines = !self.wrap_lines;
+                self.wrap_line_heights.invalidate_measurements();
+                self.message = AppMessage::Info(if self.wrap_lines {
+                    "Wrap Lines enabled".to_owned()
+                } else {
+                    "Wrap Lines disabled".to_owned()
+                });
+            }
+            ShortcutAction::ToggleHelp => {
+                self.show_help = !self.show_help;
+            }
+            ShortcutAction::ZoomIn => self.zoom_editor(1.1),
+            ShortcutAction::ZoomOut => self.zoom_editor(1.0 / 1.1),
+            ShortcutAction::ResetZoom => self.reset_editor_zoom(),
+        }
+
+        context.request_repaint();
+    }
+
+    fn open_search_panel(&mut self) {
+        self.sidebar_visible = true;
+        self.active_view = SidebarView::Search;
+        self.message = AppMessage::Info("Search ready".to_owned());
+    }
+
+    fn open_go_to_line(&mut self) {
+        self.go_to_line.visible = true;
+        self.go_to_line.input = self.current_line_hint().to_string();
+        self.go_to_line.error = None;
+        self.go_to_line.request_focus = true;
+    }
+
+    fn current_line_hint(&self) -> usize {
+        match &self.document {
+            ActiveDocument::Inline(_) => 1,
+            ActiveDocument::Large(document) => document.viewport_start_line() + 1,
+        }
+    }
+
+    fn document_line_count(&self) -> usize {
+        match &self.document {
+            ActiveDocument::Inline(document) => document.metrics().visual_lines,
+            ActiveDocument::Large(document) => document.file_line_count(),
+        }
+        .max(1)
+    }
+
+    fn submit_go_to_line(&mut self, context: &egui::Context) {
+        let line_count = self.document_line_count();
+        let line_index = match parse_go_to_line_index(&self.go_to_line.input, line_count) {
+            Ok(line_index) => line_index,
+            Err(error) => {
+                self.go_to_line.error = Some(error);
+                return;
+            }
+        };
+
+        self.go_to_line.visible = false;
+        self.go_to_line.error = None;
+
+        if let ActiveDocument::Inline(document) = &self.document {
+            self.pending_inline_cursor = Some(line_start_char_index(document.text(), line_index));
+            self.message = AppMessage::Info(format!("Moved cursor to line {}", line_index + 1));
+        } else {
+            self.move_large_viewport_to_line(line_index);
+        }
+
+        context.request_repaint();
+    }
+
+    fn zoom_editor(&mut self, multiplier: f32) {
+        self.editor_font_size = (self.editor_font_size * multiplier)
+            .clamp(MIN_EDITOR_FONT_SIZE, MAX_EDITOR_FONT_SIZE)
+            .round();
+        self.wrap_line_heights.invalidate_measurements();
+        self.message = AppMessage::Info(format!("Editor zoom {}px", self.editor_font_size));
+    }
+
+    fn reset_editor_zoom(&mut self) {
+        self.editor_font_size = DEFAULT_EDITOR_FONT_SIZE;
+        self.wrap_line_heights.invalidate_measurements();
+        self.message = AppMessage::Info(format!("Editor zoom {}px", self.editor_font_size));
+    }
+
     fn show_menu_bar(&mut self, context: &egui::Context) {
         let frame = Frame::default()
             .fill(VSCODE_PANEL)
@@ -431,9 +596,40 @@ impl PhantomApp {
                             }
                         });
 
+                        ui.menu_button("Edit", |ui| {
+                            if ui.button("Find...").clicked() {
+                                self.open_search_panel();
+                                ui.close_menu();
+                            }
+                            if ui.button("Go to Line...").clicked() {
+                                self.open_go_to_line();
+                                ui.close_menu();
+                            }
+                        });
+
                         ui.menu_button("View", |ui| {
                             ui.checkbox(&mut self.sidebar_visible, "Show Sidebar");
                             ui.checkbox(&mut self.wrap_lines, "Wrap Lines");
+                            ui.separator();
+                            if ui.button("Zoom In").clicked() {
+                                self.zoom_editor(1.1);
+                                ui.close_menu();
+                            }
+                            if ui.button("Zoom Out").clicked() {
+                                self.zoom_editor(1.0 / 1.1);
+                                ui.close_menu();
+                            }
+                            if ui.button("Reset Zoom").clicked() {
+                                self.reset_editor_zoom();
+                                ui.close_menu();
+                            }
+                        });
+
+                        ui.menu_button("Help", |ui| {
+                            if ui.button("Keyboard Shortcuts").clicked() {
+                                self.show_help = true;
+                                ui.close_menu();
+                            }
                         });
                     });
 
@@ -856,6 +1052,8 @@ impl PhantomApp {
                     return;
                 }
 
+                let editor_font_size = self.editor_font_size;
+                let pending_inline_cursor = &mut self.pending_inline_cursor;
                 let large_editor_action = match &mut self.document {
                     ActiveDocument::Inline(document) => {
                         let wrap_lines = self.wrap_lines;
@@ -864,6 +1062,7 @@ impl PhantomApp {
                             document.text(),
                             available_width,
                             wrap_lines,
+                            editor_font_size,
                         );
                         let scroll_area = if wrap_lines {
                             egui::ScrollArea::vertical()
@@ -873,9 +1072,23 @@ impl PhantomApp {
 
                         scroll_area.auto_shrink([false, false]).show(ui, |ui| {
                             ui.set_min_width(editor_width);
-                            let editor = editor_widget(document.text_mut(), editor_width);
+                            let editor_id = ui.make_persistent_id(INLINE_EDITOR_ID_SOURCE);
+                            let focus_editor = apply_inline_cursor_request(
+                                ui.ctx(),
+                                editor_id,
+                                pending_inline_cursor.take(),
+                            );
+                            let editor =
+                                editor_widget(document.text_mut(), editor_width, editor_font_size)
+                                    .id(editor_id);
 
-                            if ui.add_sized(ui.available_size(), editor).changed() {
+                            let response = ui.add_sized(ui.available_size(), editor);
+
+                            if focus_editor {
+                                response.request_focus();
+                            }
+
+                            if response.changed() {
                                 document.record_text_change();
                             }
                         });
@@ -885,6 +1098,7 @@ impl PhantomApp {
                         ui,
                         document,
                         self.wrap_lines,
+                        editor_font_size,
                         &mut self.wrap_line_heights,
                     ),
                 };
@@ -893,6 +1107,97 @@ impl PhantomApp {
                     self.apply_large_editor_action(action);
                 }
             });
+    }
+
+    fn show_go_to_line_window(&mut self, context: &egui::Context) {
+        if !self.go_to_line.visible {
+            return;
+        }
+
+        let mut open = self.go_to_line.visible;
+        let mut submit = false;
+        let mut cancel = false;
+        let request_focus = self.go_to_line.request_focus;
+
+        egui::Window::new("Go to Line")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(context, |ui| {
+                ui.set_min_width(260.0);
+                ui.label(
+                    RichText::new(format!("Line 1..{}", self.document_line_count()))
+                        .color(VSCODE_TEXT_DIM),
+                );
+                let response = ui.add(
+                    TextEdit::singleline(&mut self.go_to_line.input)
+                        .desired_width(220.0)
+                        .id(ui.make_persistent_id("go_to_line_input"))
+                        .hint_text("Line number"),
+                );
+
+                if request_focus {
+                    response.request_focus();
+                }
+
+                let enter_pressed = ui.input(|input| input.key_pressed(egui::Key::Enter));
+
+                if response.lost_focus() && enter_pressed {
+                    submit = true;
+                }
+
+                if let Some(error) = &self.go_to_line.error {
+                    ui.label(RichText::new(error).color(VSCODE_STATUS_ERROR));
+                }
+
+                ui.horizontal(|ui| {
+                    if ui.button("Go").clicked() {
+                        submit = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.go_to_line.error = None;
+                        cancel = true;
+                    }
+                });
+            });
+
+        if cancel {
+            open = false;
+        }
+
+        self.go_to_line.visible = open;
+        self.go_to_line.request_focus = false;
+
+        if submit {
+            self.submit_go_to_line(context);
+        }
+    }
+
+    fn show_help_window(&mut self, context: &egui::Context) {
+        if !self.show_help {
+            return;
+        }
+
+        let mut open = self.show_help;
+
+        egui::Window::new("Keyboard Shortcuts")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(context, |ui| {
+                ui.set_min_width(420.0);
+                help_row(ui, "New", "Cmd/Ctrl+N");
+                help_row(ui, "Open", "Cmd/Ctrl+O or drop a file");
+                help_row(ui, "Save", "Cmd/Ctrl+S");
+                help_row(ui, "Save As", "Cmd/Ctrl+Shift+S");
+                help_row(ui, "Find", "Cmd/Ctrl+F, F3");
+                help_row(ui, "Go to Line", "Cmd/Ctrl+G");
+                help_row(ui, "Wrap Lines", "Alt+Z");
+                help_row(ui, "Zoom", "Cmd/Ctrl+Plus, Minus, 0");
+                help_row(ui, "Help", "F1");
+            });
+
+        self.show_help = open;
     }
 
     fn show_status_bar(&mut self, context: &egui::Context) {
@@ -937,6 +1242,8 @@ impl PhantomApp {
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(status_text(self.document.mode_label()));
+                        ui.add_space(12.0);
+                        ui.label(status_text(format!("{}px", self.editor_font_size)));
                         ui.add_space(12.0);
                         ui.label(status_text(self.message.text()));
                     });
@@ -1242,6 +1549,7 @@ fn show_large_virtual_editor(
     ui: &mut egui::Ui,
     document: &mut LargeDocument,
     wrap_lines: bool,
+    editor_font_size: f32,
     wrap_line_heights: &mut WrapLineHeightCache,
 ) -> Option<LargeEditorAction> {
     ui.horizontal(|ui| {
@@ -1270,11 +1578,16 @@ fn show_large_virtual_editor(
     ui.add_space(4.0);
 
     let available_width = ui.available_width();
-    let content_width =
-        editor_content_width_for_text(document.viewport_text(), available_width, wrap_lines)
-            .max(available_width);
+    let content_width = editor_content_width_for_text(
+        document.viewport_text(),
+        available_width,
+        wrap_lines,
+        editor_font_size,
+    )
+    .max(available_width);
     let text_width = editor_text_width(content_width, wrap_lines);
     let line_count = document.file_line_count().max(1);
+    let row_height = editor_row_height(editor_font_size);
     let mut action = None;
 
     if wrap_lines {
@@ -1289,6 +1602,8 @@ fn show_large_virtual_editor(
                         line_count,
                         content_width,
                         text_width,
+                        row_height,
+                        editor_font_size,
                     },
                     WrappedRowsState {
                         cache: wrap_line_heights,
@@ -1299,8 +1614,6 @@ fn show_large_virtual_editor(
 
         return action;
     }
-
-    let row_height = EDITOR_ROW_HEIGHT;
 
     egui::ScrollArea::both()
         .auto_shrink([false, false])
@@ -1331,9 +1644,15 @@ fn show_large_virtual_editor(
                     continue;
                 }
 
-                if let Some(line_message) =
-                    show_virtual_line(ui, document, line_index, row_height, text_width, wrap_lines)
-                {
+                if let Some(line_message) = show_virtual_line(
+                    ui,
+                    document,
+                    line_index,
+                    row_height,
+                    text_width,
+                    wrap_lines,
+                    editor_font_size,
+                ) {
                     action = Some(LargeEditorAction::Message(line_message));
                 }
             }
@@ -1347,11 +1666,20 @@ struct WrappedRowsGeometry {
     line_count: usize,
     content_width: f32,
     text_width: f32,
+    row_height: f32,
+    editor_font_size: f32,
 }
 
 struct WrappedRowsState<'a> {
     cache: &'a mut WrapLineHeightCache,
     action: &'a mut Option<LargeEditorAction>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WrappedLineMeasurement {
+    text_width: f32,
+    row_height: f32,
+    editor_font_size: f32,
 }
 
 fn show_wrapped_large_virtual_rows(
@@ -1368,19 +1696,31 @@ fn show_wrapped_large_virtual_rows(
         geometry.text_width,
         document.viewport_start_line()..document.viewport_end_line(),
     );
-    let measurement_line_range =
-        wrapped_measurement_line_range(geometry.viewport, geometry.line_count, &state.cache.extras);
+    let measurement_line_range = wrapped_measurement_line_range(
+        geometry.viewport,
+        geometry.line_count,
+        geometry.row_height,
+        &state.cache.extras,
+    );
 
     measure_wrapped_line_height_extras(
         ui,
         document,
-        geometry.text_width,
+        WrappedLineMeasurement {
+            text_width: geometry.text_width,
+            row_height: geometry.row_height,
+            editor_font_size: geometry.editor_font_size,
+        },
         measurement_line_range,
         &mut state.cache.extras,
         &mut state.cache.measured_lines,
     );
 
-    let total_height = virtual_editor_total_height(geometry.line_count, &state.cache.extras);
+    let total_height = virtual_editor_total_height(
+        geometry.line_count,
+        geometry.row_height,
+        &state.cache.extras,
+    );
 
     ui.set_height(total_height);
     ui.set_min_width(geometry.content_width);
@@ -1388,8 +1728,10 @@ fn show_wrapped_large_virtual_rows(
     let anchored_this_frame = if let Some(anchor_line_index) = state.cache.scroll_anchor_line.take()
     {
         if anchor_line_index < geometry.line_count {
-            let anchor_top = virtual_line_top(anchor_line_index, &state.cache.extras);
-            let anchor_height = virtual_line_height(anchor_line_index, &state.cache.extras);
+            let anchor_top =
+                virtual_line_top(anchor_line_index, geometry.row_height, &state.cache.extras);
+            let anchor_height =
+                virtual_line_height(anchor_line_index, geometry.row_height, &state.cache.extras);
             let anchor_rect = egui::Rect::from_min_size(
                 egui::pos2(ui.max_rect().left(), ui.max_rect().top() + anchor_top),
                 Vec2::new(geometry.content_width, anchor_height),
@@ -1405,17 +1747,18 @@ fn show_wrapped_large_virtual_rows(
     let mut line_index = line_index_at_virtual_offset(
         geometry.viewport.min.y,
         geometry.line_count,
+        geometry.row_height,
         &state.cache.extras,
     );
 
-    let mut line_top = virtual_line_top(line_index, &state.cache.extras);
+    let mut line_top = virtual_line_top(line_index, geometry.row_height, &state.cache.extras);
 
     while line_index < geometry.line_count {
         if line_top > geometry.viewport.max.y {
             break;
         }
 
-        let line_height = virtual_line_height(line_index, &state.cache.extras);
+        let line_height = virtual_line_height(line_index, geometry.row_height, &state.cache.extras);
         let row_rect = egui::Rect::from_min_size(
             egui::pos2(ui.max_rect().left(), ui.max_rect().top() + line_top),
             Vec2::new(geometry.content_width, line_height),
@@ -1437,6 +1780,7 @@ fn show_wrapped_large_virtual_rows(
                 line_height,
                 geometry.text_width,
                 true,
+                geometry.editor_font_size,
             ) {
                 *state.action = Some(LargeEditorAction::Message(line_message));
             }
@@ -1460,7 +1804,7 @@ fn with_positioned_row_ui<R>(
 fn measure_wrapped_line_height_extras(
     ui: &egui::Ui,
     document: &LargeDocument,
-    text_width: f32,
+    measurement: WrappedLineMeasurement,
     line_range: Range<usize>,
     line_height_extras: &mut BTreeMap<usize, f32>,
     measured_lines: &mut BTreeSet<usize>,
@@ -1473,9 +1817,20 @@ fn measure_wrapped_line_height_extras(
         let Some(line_text) = document.file_line_text(line_index) else {
             continue;
         };
-        let line_height = editor_line_row_height_for_ui(ui, line_text, text_width);
+        let line_height = editor_line_row_height_for_ui(
+            ui,
+            line_text,
+            measurement.text_width,
+            measurement.row_height,
+            measurement.editor_font_size,
+        );
 
-        update_line_height_extra(line_height_extras, line_index, line_height);
+        update_line_height_extra(
+            line_height_extras,
+            line_index,
+            line_height,
+            measurement.row_height,
+        );
         measured_lines.insert(line_index);
     }
 }
@@ -1483,14 +1838,17 @@ fn measure_wrapped_line_height_extras(
 fn wrapped_measurement_line_range(
     viewport: egui::Rect,
     line_count: usize,
+    row_height: f32,
     line_height_extras: &BTreeMap<usize, f32>,
 ) -> Range<usize> {
     let Some(last_line_index) = line_count.checked_sub(1) else {
         return 0..0;
     };
-    let start = line_index_at_virtual_offset(viewport.min.y, line_count, line_height_extras)
-        .saturating_sub(WRAP_MEASURE_OVERSCAN_LINES);
-    let end_line = line_index_at_virtual_offset(viewport.max.y, line_count, line_height_extras);
+    let start =
+        line_index_at_virtual_offset(viewport.min.y, line_count, row_height, line_height_extras)
+            .saturating_sub(WRAP_MEASURE_OVERSCAN_LINES);
+    let end_line =
+        line_index_at_virtual_offset(viewport.max.y, line_count, row_height, line_height_extras);
     let end = end_line
         .saturating_add(WRAP_MEASURE_OVERSCAN_LINES + 1)
         .min(line_count)
@@ -1531,8 +1889,9 @@ fn update_line_height_extra(
     line_height_extras: &mut BTreeMap<usize, f32>,
     line_index: usize,
     line_height: f32,
+    row_height: f32,
 ) {
-    let extra_height = line_height - EDITOR_ROW_HEIGHT;
+    let extra_height = line_height - row_height;
 
     if extra_height > 0.0 {
         line_height_extras.insert(line_index, extra_height);
@@ -1543,13 +1902,18 @@ fn update_line_height_extra(
 
 fn virtual_editor_total_height(
     line_count: usize,
+    row_height: f32,
     line_height_extras: &BTreeMap<usize, f32>,
 ) -> f32 {
-    line_count as f32 * EDITOR_ROW_HEIGHT + line_height_extras.values().copied().sum::<f32>()
+    line_count as f32 * row_height + line_height_extras.values().copied().sum::<f32>()
 }
 
-fn virtual_line_top(line_index: usize, line_height_extras: &BTreeMap<usize, f32>) -> f32 {
-    line_index as f32 * EDITOR_ROW_HEIGHT
+fn virtual_line_top(
+    line_index: usize,
+    row_height: f32,
+    line_height_extras: &BTreeMap<usize, f32>,
+) -> f32 {
+    line_index as f32 * row_height
         + line_height_extras
             .range(..line_index)
             .map(|(_line_index, extra_height)| extra_height)
@@ -1557,13 +1921,18 @@ fn virtual_line_top(line_index: usize, line_height_extras: &BTreeMap<usize, f32>
             .sum::<f32>()
 }
 
-fn virtual_line_height(line_index: usize, line_height_extras: &BTreeMap<usize, f32>) -> f32 {
-    EDITOR_ROW_HEIGHT + line_height_extras.get(&line_index).copied().unwrap_or(0.0)
+fn virtual_line_height(
+    line_index: usize,
+    row_height: f32,
+    line_height_extras: &BTreeMap<usize, f32>,
+) -> f32 {
+    row_height + line_height_extras.get(&line_index).copied().unwrap_or(0.0)
 }
 
 fn line_index_at_virtual_offset(
     offset_y: f32,
     line_count: usize,
+    row_height: f32,
     line_height_extras: &BTreeMap<usize, f32>,
 ) -> usize {
     let Some(last_line_index) = line_count.checked_sub(1) else {
@@ -1574,15 +1943,15 @@ fn line_index_at_virtual_offset(
     let mut accumulated_extra_height = 0.0;
 
     for (line_index, extra_height) in line_height_extras {
-        let line_top = *line_index as f32 * EDITOR_ROW_HEIGHT + accumulated_extra_height;
+        let line_top = *line_index as f32 * row_height + accumulated_extra_height;
 
         if offset_y < line_top {
-            return (((offset_y - accumulated_extra_height).max(0.0) / EDITOR_ROW_HEIGHT).floor()
+            return (((offset_y - accumulated_extra_height).max(0.0) / row_height).floor()
                 as usize)
                 .min(last_line_index);
         }
 
-        let line_bottom = line_top + EDITOR_ROW_HEIGHT + *extra_height;
+        let line_bottom = line_top + row_height + *extra_height;
 
         if offset_y < line_bottom {
             return (*line_index).min(last_line_index);
@@ -1591,7 +1960,7 @@ fn line_index_at_virtual_offset(
         accumulated_extra_height += *extra_height;
     }
 
-    ((offset_y - accumulated_extra_height).max(0.0) / EDITOR_ROW_HEIGHT)
+    ((offset_y - accumulated_extra_height).max(0.0) / row_height)
         .floor()
         .min(last_line_index as f32) as usize
 }
@@ -1631,6 +2000,7 @@ fn show_virtual_line(
     row_height: f32,
     text_width: f32,
     wrap_lines: bool,
+    editor_font_size: f32,
 ) -> Option<AppMessage> {
     let mut message = None;
 
@@ -1662,6 +2032,7 @@ fn show_virtual_line(
                     text_width,
                     row_height,
                     wrap_lines,
+                    editor_font_size,
                     editor_id,
                 )
             })
@@ -1736,6 +2107,125 @@ fn path_label_layout_job(path_text: &str, wrap_width: f32) -> LayoutJob {
     layout_job
 }
 
+fn collect_shortcut_actions(context: &egui::Context) -> Vec<ShortcutAction> {
+    let mut actions = Vec::new();
+
+    context.input_mut(|input| {
+        if input.consume_shortcut(&KeyboardShortcut::new(
+            Modifiers::COMMAND | Modifiers::SHIFT,
+            egui::Key::S,
+        )) {
+            actions.push(ShortcutAction::SaveAs);
+        }
+        if input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::S)) {
+            actions.push(ShortcutAction::Save);
+        }
+        if input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::N)) {
+            actions.push(ShortcutAction::New);
+        }
+        if input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::O)) {
+            actions.push(ShortcutAction::Open);
+        }
+        if input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::F)) {
+            actions.push(ShortcutAction::Search);
+        }
+        if input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::G)) {
+            actions.push(ShortcutAction::GoToLine);
+        }
+        if input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Plus))
+            || input.consume_shortcut(&KeyboardShortcut::new(
+                Modifiers::COMMAND,
+                egui::Key::Equals,
+            ))
+        {
+            actions.push(ShortcutAction::ZoomIn);
+        }
+        if input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Minus)) {
+            actions.push(ShortcutAction::ZoomOut);
+        }
+        if input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Num0)) {
+            actions.push(ShortcutAction::ResetZoom);
+        }
+        if input.consume_key(Modifiers::ALT, egui::Key::Z) {
+            actions.push(ShortcutAction::ToggleWrap);
+        }
+        if input.consume_key(Modifiers::NONE, egui::Key::F1) {
+            actions.push(ShortcutAction::ToggleHelp);
+        }
+        if input.consume_key(Modifiers::NONE, egui::Key::F3)
+            || input.consume_key(Modifiers::SHIFT, egui::Key::F3)
+        {
+            actions.push(ShortcutAction::RunSearch);
+        }
+    });
+
+    actions
+}
+
+fn parse_go_to_line_index(input: &str, line_count: usize) -> Result<usize, String> {
+    let trimmed = input.trim();
+
+    if trimmed.is_empty() {
+        return Err("Enter a line number".to_owned());
+    }
+
+    let line_number = trimmed
+        .parse::<usize>()
+        .map_err(|_| "Line number must be a positive integer".to_owned())?;
+
+    if line_number == 0 {
+        return Err("Line number starts at 1".to_owned());
+    }
+
+    Ok(line_number.min(line_count.max(1)) - 1)
+}
+
+fn line_start_char_index(text: &str, line_index: usize) -> usize {
+    if line_index == 0 {
+        return 0;
+    }
+
+    let mut current_line = 0;
+
+    for (byte_index, character) in text.char_indices() {
+        if character == '\n' {
+            current_line += 1;
+
+            if current_line == line_index {
+                return text[..byte_index + character.len_utf8()].chars().count();
+            }
+        }
+    }
+
+    text.chars().count()
+}
+
+fn apply_inline_cursor_request(
+    context: &egui::Context,
+    editor_id: egui::Id,
+    char_index: Option<usize>,
+) -> bool {
+    let Some(char_index) = char_index else {
+        return false;
+    };
+
+    let mut state = TextEditState::load(context, editor_id).unwrap_or_default();
+    state
+        .cursor
+        .set_char_range(Some(CCursorRange::one(CCursor::new(char_index))));
+    state.store(context, editor_id);
+
+    true
+}
+
+fn editor_monospace_char_width(editor_font_size: f32) -> f32 {
+    EDITOR_MONOSPACE_CHAR_WIDTH * editor_font_size / DEFAULT_EDITOR_FONT_SIZE
+}
+
+fn editor_row_height(editor_font_size: f32) -> f32 {
+    (EDITOR_ROW_HEIGHT * editor_font_size / DEFAULT_EDITOR_FONT_SIZE).ceil()
+}
+
 fn longest_line_character_count(text: &str) -> usize {
     text.lines()
         .map(|line| line.chars().count())
@@ -1743,8 +2233,10 @@ fn longest_line_character_count(text: &str) -> usize {
         .unwrap_or(0)
 }
 
-fn editor_text_width_for_characters(character_count: usize) -> f32 {
-    (character_count as f32 * EDITOR_MONOSPACE_CHAR_WIDTH)
+fn editor_text_width_for_characters(character_count: usize, editor_font_size: f32) -> f32 {
+    let char_width = editor_monospace_char_width(editor_font_size);
+
+    (character_count as f32 * char_width)
         .max(EDITOR_MIN_TEXT_WIDTH)
         .ceil()
 }
@@ -1759,7 +2251,12 @@ fn editor_text_width(content_width: f32, wrap_lines: bool) -> f32 {
     (content_width - EDITOR_GUTTER_WIDTH - EDITOR_GUTTER_GAP).max(minimum_width)
 }
 
-fn editor_content_width_for_text(text: &str, available_width: f32, wrap_lines: bool) -> f32 {
+fn editor_content_width_for_text(
+    text: &str,
+    available_width: f32,
+    wrap_lines: bool,
+    editor_font_size: f32,
+) -> f32 {
     let minimum_width = if wrap_lines {
         EDITOR_GUTTER_WIDTH + EDITOR_GUTTER_GAP + EDITOR_MIN_WRAP_TEXT_WIDTH
     } else {
@@ -1775,26 +2272,33 @@ fn editor_content_width_for_text(text: &str, available_width: f32, wrap_lines: b
         return available_width;
     }
 
-    let text_width = editor_text_width_for_characters(longest_line_character_count(text));
+    let text_width =
+        editor_text_width_for_characters(longest_line_character_count(text), editor_font_size);
 
     (EDITOR_GUTTER_WIDTH + EDITOR_GUTTER_GAP + text_width).max(available_width)
 }
 
-fn editor_line_row_height_for_ui(ui: &egui::Ui, text: &str, text_width: f32) -> f32 {
+fn editor_line_row_height_for_ui(
+    ui: &egui::Ui,
+    text: &str,
+    text_width: f32,
+    row_height: f32,
+    editor_font_size: f32,
+) -> f32 {
     let galley_height = ui.fonts(|fonts| {
         fonts
-            .layout_job(editor_line_layout_job(text, text_width))
+            .layout_job(editor_line_layout_job(text, text_width, editor_font_size))
             .size()
             .y
     });
 
-    galley_height.max(EDITOR_ROW_HEIGHT).ceil()
+    galley_height.max(row_height).ceil()
 }
 
-fn editor_line_layout_job(text: &str, wrap_width: f32) -> LayoutJob {
+fn editor_line_layout_job(text: &str, wrap_width: f32, editor_font_size: f32) -> LayoutJob {
     let mut layout_job = LayoutJob::single_section(
         text.to_owned(),
-        TextFormat::simple(editor_font_id(), VSCODE_TEXT),
+        TextFormat::simple(editor_font_id(editor_font_size), VSCODE_TEXT),
     );
     layout_job.wrap.max_width = wrap_width.max(EDITOR_MIN_WRAP_TEXT_WIDTH);
     layout_job.wrap.break_anywhere = true;
@@ -1802,13 +2306,13 @@ fn editor_line_layout_job(text: &str, wrap_width: f32) -> LayoutJob {
     layout_job
 }
 
-fn editor_font_id() -> FontId {
-    FontId::new(14.0, FontFamily::Monospace)
+fn editor_font_id(editor_font_size: f32) -> FontId {
+    FontId::new(editor_font_size, FontFamily::Monospace)
 }
 
-fn editor_widget(text: &mut String, width: f32) -> TextEdit<'_> {
+fn editor_widget(text: &mut String, width: f32, editor_font_size: f32) -> TextEdit<'_> {
     TextEdit::multiline(text)
-        .font(editor_font_id())
+        .font(editor_font_id(editor_font_size))
         .text_color(VSCODE_TEXT)
         .desired_width(width)
         .desired_rows(32)
@@ -1822,29 +2326,37 @@ fn add_line_editor(
     width: f32,
     height: f32,
     wrap_lines: bool,
+    editor_font_size: f32,
     id: egui::Id,
 ) -> egui::Response {
     if wrap_lines {
         let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
-            ui.fonts(|fonts| fonts.layout_job(editor_line_layout_job(text, wrap_width)))
+            ui.fonts(|fonts| {
+                fonts.layout_job(editor_line_layout_job(text, wrap_width, editor_font_size))
+            })
         };
 
         return ui.add_sized(
             Vec2::new(width, height),
-            wrapped_line_editor_widget(text, width, id).layouter(&mut layouter),
+            wrapped_line_editor_widget(text, width, editor_font_size, id).layouter(&mut layouter),
         );
     }
 
     ui.add_sized(
         Vec2::new(width, height),
-        line_editor_widget(text, width, id),
+        line_editor_widget(text, width, editor_font_size, id),
     )
 }
 
-fn wrapped_line_editor_widget(text: &mut String, width: f32, id: egui::Id) -> TextEdit<'_> {
+fn wrapped_line_editor_widget(
+    text: &mut String,
+    width: f32,
+    editor_font_size: f32,
+    id: egui::Id,
+) -> TextEdit<'_> {
     TextEdit::multiline(text)
         .id(id)
-        .font(editor_font_id())
+        .font(editor_font_id(editor_font_size))
         .text_color(VSCODE_TEXT)
         .desired_width(width)
         .desired_rows(1)
@@ -1854,10 +2366,15 @@ fn wrapped_line_editor_widget(text: &mut String, width: f32, id: egui::Id) -> Te
         .frame(false)
 }
 
-fn line_editor_widget(text: &mut String, width: f32, id: egui::Id) -> TextEdit<'_> {
+fn line_editor_widget(
+    text: &mut String,
+    width: f32,
+    editor_font_size: f32,
+    id: egui::Id,
+) -> TextEdit<'_> {
     TextEdit::singleline(text)
         .id(id)
-        .font(editor_font_id())
+        .font(editor_font_id(editor_font_size))
         .text_color(VSCODE_TEXT)
         .desired_width(width)
         .clip_text(false)
@@ -1869,6 +2386,15 @@ fn parent_directory(path: &Path) -> Option<PathBuf> {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .map(Path::to_path_buf)
+}
+
+fn help_row(ui: &mut egui::Ui, action: &str, shortcut: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(action).color(VSCODE_TEXT));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(RichText::new(shortcut).color(VSCODE_TEXT_DIM).monospace());
+        });
+    });
 }
 
 fn status_text(value: impl Into<String>) -> RichText {
@@ -1967,6 +2493,49 @@ mod tests {
     }
 
     #[test]
+    fn parse_go_to_line_index_clamps_to_document_bounds() {
+        assert_eq!(parse_go_to_line_index("1", 10).unwrap(), 0);
+        assert_eq!(parse_go_to_line_index("999", 10).unwrap(), 9);
+        assert_eq!(parse_go_to_line_index(" 3 ", 10).unwrap(), 2);
+    }
+
+    #[test]
+    fn parse_go_to_line_index_rejects_invalid_input() {
+        assert!(parse_go_to_line_index("", 10).is_err());
+        assert!(parse_go_to_line_index("0", 10).is_err());
+        assert!(parse_go_to_line_index("line", 10).is_err());
+    }
+
+    #[test]
+    fn line_start_char_index_finds_target_line_start() {
+        assert_eq!(line_start_char_index("alpha\nbeta\ngamma", 0), 0);
+        assert_eq!(line_start_char_index("alpha\nbeta\ngamma", 1), 6);
+        assert_eq!(line_start_char_index("alpha\nbeta\ngamma", 2), 11);
+        assert_eq!(line_start_char_index("alpha\nbeta\ngamma", 99), 16);
+    }
+
+    #[test]
+    fn open_go_to_line_prefills_current_line_and_requests_focus() {
+        let mut app = PhantomApp::default();
+
+        app.open_go_to_line();
+
+        assert!(app.go_to_line.visible);
+        assert_eq!(app.go_to_line.input, "1");
+        assert!(app.go_to_line.request_focus);
+        assert!(app.go_to_line.error.is_none());
+    }
+
+    #[test]
+    fn editor_zoom_scales_row_height_and_width_estimates() {
+        assert!(editor_row_height(DEFAULT_EDITOR_FONT_SIZE * 2.0) > EDITOR_ROW_HEIGHT);
+        assert!(
+            editor_text_width_for_characters(80, DEFAULT_EDITOR_FONT_SIZE * 2.0)
+                > editor_text_width_for_characters(80, DEFAULT_EDITOR_FONT_SIZE)
+        );
+    }
+
+    #[test]
     fn should_block_close_for_dirty_document() {
         let mut document = EditorDocument::untitled();
         document.replace_text("draft".to_owned());
@@ -2017,14 +2586,15 @@ mod tests {
     #[test]
     fn editor_content_width_expands_for_long_lines_when_not_wrapping() {
         let long_line = "x".repeat(1_000);
-        let width = editor_content_width_for_text(&long_line, 480.0, false);
+        let width =
+            editor_content_width_for_text(&long_line, 480.0, false, DEFAULT_EDITOR_FONT_SIZE);
 
         assert!(width > 480.0);
         assert_eq!(
             width,
             EDITOR_GUTTER_WIDTH
                 + EDITOR_GUTTER_GAP
-                + editor_text_width_for_characters(long_line.len())
+                + editor_text_width_for_characters(long_line.len(), DEFAULT_EDITOR_FONT_SIZE)
         );
     }
 
@@ -2033,7 +2603,7 @@ mod tests {
         let long_line = "x".repeat(1_000);
 
         assert_eq!(
-            editor_content_width_for_text(&long_line, 480.0, true),
+            editor_content_width_for_text(&long_line, 480.0, true, DEFAULT_EDITOR_FONT_SIZE),
             480.0
         );
     }
@@ -2044,14 +2614,14 @@ mod tests {
 
         assert_eq!(editor_text_width(content_width, true), 120.0);
         assert_eq!(
-            editor_content_width_for_text("x", 10.0, true),
+            editor_content_width_for_text("x", 10.0, true, DEFAULT_EDITOR_FONT_SIZE),
             EDITOR_GUTTER_WIDTH + EDITOR_GUTTER_GAP + EDITOR_MIN_WRAP_TEXT_WIDTH
         );
     }
 
     #[test]
     fn editor_line_layout_job_wraps_at_requested_text_width() {
-        let layout_job = editor_line_layout_job("abcdef", 123.0);
+        let layout_job = editor_line_layout_job("abcdef", 123.0, DEFAULT_EDITOR_FONT_SIZE);
 
         assert_eq!(layout_job.wrap.max_width, 123.0);
         assert!(layout_job.wrap.break_anywhere);
@@ -2065,13 +2635,23 @@ mod tests {
         egui::__run_test_ui(|ui| {
             let expected_height = ui.fonts(|fonts| {
                 fonts
-                    .layout_job(editor_line_layout_job(&long_json_line, text_width))
+                    .layout_job(editor_line_layout_job(
+                        &long_json_line,
+                        text_width,
+                        DEFAULT_EDITOR_FONT_SIZE,
+                    ))
                     .size()
                     .y
                     .max(EDITOR_ROW_HEIGHT)
                     .ceil()
             });
-            let measured_height = editor_line_row_height_for_ui(ui, &long_json_line, text_width);
+            let measured_height = editor_line_row_height_for_ui(
+                ui,
+                &long_json_line,
+                text_width,
+                EDITOR_ROW_HEIGHT,
+                DEFAULT_EDITOR_FONT_SIZE,
+            );
 
             assert_eq!(measured_height, expected_height);
         });
@@ -2084,7 +2664,8 @@ mod tests {
             egui::pos2(200.0, EDITOR_ROW_HEIGHT * 510.0),
         );
 
-        let range = wrapped_measurement_line_range(viewport, 10_000, &BTreeMap::new());
+        let range =
+            wrapped_measurement_line_range(viewport, 10_000, EDITOR_ROW_HEIGHT, &BTreeMap::new());
 
         assert_eq!(range.start, 500 - WRAP_MEASURE_OVERSCAN_LINES);
         assert_eq!(range.end, 510 + WRAP_MEASURE_OVERSCAN_LINES + 1);
@@ -2095,20 +2676,23 @@ mod tests {
         let line_height_extras = BTreeMap::from([(2, EDITOR_ROW_HEIGHT * 2.0)]);
 
         assert_eq!(
-            virtual_editor_total_height(5, &line_height_extras),
+            virtual_editor_total_height(5, EDITOR_ROW_HEIGHT, &line_height_extras),
             EDITOR_ROW_HEIGHT * 7.0
         );
-        assert_eq!(virtual_line_top(1, &line_height_extras), EDITOR_ROW_HEIGHT);
         assert_eq!(
-            virtual_line_top(3, &line_height_extras),
+            virtual_line_top(1, EDITOR_ROW_HEIGHT, &line_height_extras),
+            EDITOR_ROW_HEIGHT
+        );
+        assert_eq!(
+            virtual_line_top(3, EDITOR_ROW_HEIGHT, &line_height_extras),
             EDITOR_ROW_HEIGHT * 5.0
         );
         assert_eq!(
-            virtual_line_height(2, &line_height_extras),
+            virtual_line_height(2, EDITOR_ROW_HEIGHT, &line_height_extras),
             EDITOR_ROW_HEIGHT * 3.0
         );
         assert_eq!(
-            virtual_line_height(3, &line_height_extras),
+            virtual_line_height(3, EDITOR_ROW_HEIGHT, &line_height_extras),
             EDITOR_ROW_HEIGHT
         );
     }
@@ -2118,15 +2702,25 @@ mod tests {
         let line_height_extras = BTreeMap::from([(2, EDITOR_ROW_HEIGHT * 2.0)]);
 
         assert_eq!(
-            line_index_at_virtual_offset(EDITOR_ROW_HEIGHT * 2.5, 5, &line_height_extras),
+            line_index_at_virtual_offset(
+                EDITOR_ROW_HEIGHT * 2.5,
+                5,
+                EDITOR_ROW_HEIGHT,
+                &line_height_extras,
+            ),
             2
         );
         assert_eq!(
-            line_index_at_virtual_offset(EDITOR_ROW_HEIGHT * 5.1, 5, &line_height_extras),
+            line_index_at_virtual_offset(
+                EDITOR_ROW_HEIGHT * 5.1,
+                5,
+                EDITOR_ROW_HEIGHT,
+                &line_height_extras,
+            ),
             3
         );
         assert_eq!(
-            line_index_at_virtual_offset(9_999.0, 5, &line_height_extras),
+            line_index_at_virtual_offset(9_999.0, 5, EDITOR_ROW_HEIGHT, &line_height_extras),
             4
         );
     }
@@ -2153,10 +2747,20 @@ mod tests {
     fn update_line_height_extra_removes_short_lines_from_cache() {
         let mut line_height_extras = BTreeMap::new();
 
-        update_line_height_extra(&mut line_height_extras, 7, EDITOR_ROW_HEIGHT * 3.0);
+        update_line_height_extra(
+            &mut line_height_extras,
+            7,
+            EDITOR_ROW_HEIGHT * 3.0,
+            EDITOR_ROW_HEIGHT,
+        );
         assert_eq!(line_height_extras.get(&7), Some(&(EDITOR_ROW_HEIGHT * 2.0)));
 
-        update_line_height_extra(&mut line_height_extras, 7, EDITOR_ROW_HEIGHT);
+        update_line_height_extra(
+            &mut line_height_extras,
+            7,
+            EDITOR_ROW_HEIGHT,
+            EDITOR_ROW_HEIGHT,
+        );
         assert!(!line_height_extras.contains_key(&7));
     }
 

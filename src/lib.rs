@@ -17,6 +17,7 @@ const BYTES_PER_MIB: u64 = 1024 * 1024;
 
 pub const DEFAULT_MAX_INLINE_EDIT_BYTES: u64 = 16 * BYTES_PER_MIB;
 pub const DEFAULT_LARGE_VIEW_BYTES: usize = 1024 * 1024;
+const LINE_INDEX_SCAN_BUFFER_BYTES: usize = 1024 * 1024;
 const LINE_INDEX_CHUNK_LINES: usize = 1024;
 const LINE_START_SCAN_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -416,23 +417,13 @@ struct FileLineIndexCheckpoint {
 
 impl LargeFileLineIndex {
     pub fn from_path(path: impl AsRef<Path>) -> io::Result<Self> {
-        let file = File::open(path)?;
+        let mut file = File::open(path)?;
         let bytes = file.metadata()?.len();
-        let mapped_file = if bytes == 0 {
-            None
-        } else {
-            Some(map_file(&file)?)
-        };
+        let mut builder = LargeFileLineIndexBuilder::new(bytes);
 
-        Ok(Self::from_bytes(
-            bytes,
-            mapped_file.as_deref().unwrap_or_default(),
-        ))
-    }
+        scan_line_index_checkpoints(&mut file, &mut builder)?;
 
-    #[must_use]
-    pub fn line_count(&self) -> usize {
-        self.line_count
+        Ok(builder.finish())
     }
 
     #[must_use]
@@ -481,14 +472,9 @@ impl LargeFileLineIndex {
         scan_line_at_or_before_from_checkpoint(path.as_ref(), checkpoint, byte_offset)
     }
 
-    fn from_bytes(bytes: u64, data: &[u8]) -> Self {
-        let mut builder = LargeFileLineIndexBuilder::new(bytes);
-
-        for newline_index in memchr_iter(b'\n', data) {
-            builder.push_line_start(newline_index as u64 + 1);
-        }
-
-        builder.finish()
+    #[must_use]
+    pub fn line_count(&self) -> usize {
+        self.line_count
     }
 
     fn checkpoint_for_line(&self, line_index: usize) -> Option<&FileLineIndexCheckpoint> {
@@ -541,6 +527,30 @@ impl LargeFileLineIndexBuilder {
             bytes: self.bytes,
         }
     }
+}
+
+fn scan_line_index_checkpoints(
+    file: &mut File,
+    builder: &mut LargeFileLineIndexBuilder,
+) -> io::Result<()> {
+    let mut buffer = vec![0; LINE_INDEX_SCAN_BUFFER_BYTES];
+    let mut absolute_offset = 0_u64;
+
+    loop {
+        let bytes_read = file.read(&mut buffer)?;
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        for newline_index in memchr_iter(b'\n', &buffer[..bytes_read]) {
+            builder.push_line_start(absolute_offset + newline_index as u64 + 1);
+        }
+
+        absolute_offset += bytes_read as u64;
+    }
+
+    Ok(())
 }
 
 fn scan_line_start_from_checkpoint(
@@ -623,7 +633,7 @@ pub struct LargeViewport {
     start_byte: u64,
     end_byte: u64,
     text: String,
-    piece_table: PieceTable,
+    piece_table: Option<PieceTable>,
     line_index: ChunkedLineIndex,
     leading_partial_line: bool,
     trailing_partial_line: bool,
@@ -643,7 +653,7 @@ impl LargeViewport {
         Self {
             start_byte,
             end_byte,
-            piece_table: PieceTable::from_original(text.clone()),
+            piece_table: None,
             line_index: ChunkedLineIndex::from_text_with_trailing_empty_line(
                 &text,
                 include_trailing_empty_line,
@@ -718,7 +728,14 @@ impl LargeViewport {
             return Ok(false);
         }
 
-        self.piece_table.replace_range(range, replacement)?;
+        if self.piece_table.is_none() {
+            self.piece_table = Some(PieceTable::from_original(self.text.clone()));
+        }
+
+        self.piece_table
+            .as_mut()
+            .expect("piece table should be initialized before edit")
+            .replace_range(range, replacement)?;
         self.rebuild_text_and_index();
 
         Ok(true)
@@ -730,7 +747,7 @@ impl LargeViewport {
             return false;
         }
 
-        self.piece_table = PieceTable::from_original(text.clone());
+        self.piece_table = None;
         self.line_index = ChunkedLineIndex::from_text(&text);
         self.text = text;
         self.leading_partial_line = false;
@@ -741,7 +758,11 @@ impl LargeViewport {
     }
 
     fn rebuild_text_and_index(&mut self) {
-        self.text = self.piece_table.text();
+        self.text = self
+            .piece_table
+            .as_ref()
+            .expect("piece table should be initialized before rebuilding text")
+            .text();
         self.line_index = ChunkedLineIndex::from_text_with_trailing_empty_line(
             &self.text,
             self.include_trailing_empty_line,
@@ -1892,6 +1913,49 @@ mod tests {
             index.line_at_or_before(&path, text.len() as u64)?,
             LINE_INDEX_CHUNK_LINES
         );
+
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn large_file_line_index_streams_across_scan_buffer_boundaries() -> io::Result<()> {
+        let path = unique_temp_path("streamed_global_line_index.txt");
+        let mut data = vec![b'a'; LINE_INDEX_SCAN_BUFFER_BYTES + 8];
+        data[LINE_INDEX_SCAN_BUFFER_BYTES - 1] = b'\n';
+        data[LINE_INDEX_SCAN_BUFFER_BYTES + 3] = b'\n';
+        fs::write(&path, &data)?;
+
+        let index = LargeFileLineIndex::from_path(&path)?;
+
+        assert_eq!(index.bytes(), data.len() as u64);
+        assert_eq!(index.line_count(), 3);
+        assert_eq!(
+            index.line_start_byte(&path, 1)?,
+            Some(LINE_INDEX_SCAN_BUFFER_BYTES as u64)
+        );
+        assert_eq!(
+            index.line_start_byte(&path, 2)?,
+            Some((LINE_INDEX_SCAN_BUFFER_BYTES + 4) as u64)
+        );
+
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn large_viewport_allocates_piece_table_only_after_edit() -> io::Result<()> {
+        let path = unique_temp_path("lazy_piece_table.txt");
+        fs::write(&path, "first\nsecond\nthird")?;
+        let mut document = open_large_document_with_viewport(&path, 64)?;
+
+        assert!(document.viewport().piece_table.is_none());
+        assert_eq!(document.file_line_text(1), Some("second"));
+
+        assert!(document.replace_file_line(1, "SECOND")?);
+
+        assert!(document.viewport().piece_table.is_some());
+        assert_eq!(document.viewport_text(), "first\nSECOND\nthird");
 
         fs::remove_file(path)?;
         Ok(())
