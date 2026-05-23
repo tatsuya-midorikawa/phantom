@@ -36,6 +36,12 @@ cargo test
 - Scroll across every indexed line in a large file instead of stopping at the first viewport.
 - Horizontally scroll long editor lines, with an optional wrap mode from the View menu.
 - Search with match-case, whole-word, and regular-expression options; Replace All is available for inline documents.
+- Highlight string and regular-expression search matches in the editor surface.
+- Highlight syntax tokens, matching brackets, selected words, and multi-selection ranges.
+- Use multi-cursor and multi-selection commands for repeated occurrences and selected line ranges in inline documents.
+- Create rectangular selections, copy rectangular slices, and paste them back across multiple lines.
+- Move, copy, and delete selected lines from menu commands or keyboard shortcuts.
+- Convert selected text or the current word to uppercase or lowercase.
 - Open Find, Go to Line, Help, file open/save, wrap, and zoom actions from keyboard shortcuts.
 - Jump to a requested line in inline documents or large-file viewports.
 - Open files by dragging and dropping them into the editor window.
@@ -51,15 +57,15 @@ cargo test
 
 ## miu Desktop Feature Gap
 
-Compared with `kenjinote/miu`, excluding Android, iOS, iPadOS, and Linux targets, phantom now covers native desktop open/save dialogs, drag-and-drop open, dark editor styling, large-file viewport editing, regex/match-case/whole-word search, inline Replace All, Go to Line, F1-style keyboard help, line wrapping, horizontal scrolling, and editor zoom.
+Compared with `kenjinote/miu`, excluding Android, iOS, iPadOS, and Linux targets, phantom now covers native desktop open/save dialogs, drag-and-drop open, dark editor styling, large-file viewport editing, regex/match-case/whole-word search, inline Replace All, Go to Line, F1-style keyboard help, line wrapping, horizontal scrolling, editor zoom, multi-cursor occurrence selection, multi-line selection commands, rectangular selection/copy/paste, line move/copy/delete commands, case conversion, syntax highlighting, bracket highlighting, word occurrence highlighting, and search-result highlighting.
 
-The remaining larger desktop gaps are multi-cursor editing, rectangular selection and paste, explicit line move/copy/delete commands, case conversion commands, syntax highlighting, bracket/word occurrence highlighting, overwrite mode, IME composition visualization, full custom clipboard semantics, and a first-class application packaging/install story for Windows and macOS. These require replacing more of the current egui `TextEdit` editing surface with a custom text interaction layer, so they are tracked as follow-up work rather than small incremental additions.
+The remaining larger desktop gaps are mouse-driven rectangular drag selection, native rectangular clipboard formats, richer custom caret painting for every secondary cursor, overwrite mode, IME composition visualization, deeper language-specific syntax grammars, and a first-class application packaging/install story for Windows and macOS. These require replacing more of the current egui `TextEdit` editing surface with a custom text interaction layer, so they are tracked as follow-up work rather than small incremental additions.
 
 ## Next Milestones
 
 - Incremental background line indexing for faster first paint on 100GB-class files.
 - SIMD-accelerated search beyond newline counting.
-- Custom text interaction layer for multi-cursor, rectangular selection, line operations, and richer selection rendering.
-- Syntax highlighting and bracket/word occurrence highlighting.
+- Custom text interaction layer for mouse-driven rectangular selection, native column clipboard formats, and richer secondary-caret rendering.
+- Deeper language-aware syntax highlighting grammars.
 - Multi-viewport editing semantics for inserts and deletes across large files.
 - Platform-specific packaging for macOS and Windows.

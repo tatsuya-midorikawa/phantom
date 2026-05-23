@@ -13,6 +13,7 @@ use eframe::egui::{
     Margin, Modifiers, RichText, Sense, Stroke, TextEdit, TextFormat, Vec2,
 };
 use phantom::{
+    editor_ops::{self, CaseTransform, TextSelection},
     open_text_document, save_document, save_large_document,
     search::{find_text_matches, line_preview, replace_all as search_replace_all, SearchOptions},
     EditorDocument, LargeDocument, OpenedDocument,
@@ -30,6 +31,13 @@ const VSCODE_STATUS_ERROR: Color32 = Color32::from_rgb(0xa1, 0x26, 0x0d);
 const VSCODE_TEXT: Color32 = Color32::from_rgb(0xcc, 0xcc, 0xcc);
 const VSCODE_TEXT_DIM: Color32 = Color32::from_rgb(0x85, 0x85, 0x85);
 const VSCODE_ACCENT: Color32 = Color32::from_rgb(0x00, 0x7a, 0xcc);
+const VSCODE_HIGHLIGHT: Color32 = Color32::from_rgb(0x61, 0x3f, 0x12);
+const VSCODE_SELECTION_HIGHLIGHT: Color32 = Color32::from_rgb(0x26, 0x4f, 0x78);
+const SYNTAX_KEYWORD: Color32 = Color32::from_rgb(0x56, 0x9c, 0xd6);
+const SYNTAX_STRING: Color32 = Color32::from_rgb(0xce, 0x91, 0x78);
+const SYNTAX_NUMBER: Color32 = Color32::from_rgb(0xb5, 0xce, 0xa8);
+const SYNTAX_COMMENT: Color32 = Color32::from_rgb(0x6a, 0x99, 0x55);
+const SYNTAX_BRACKET: Color32 = Color32::from_rgb(0xda, 0xd2, 0x70);
 const SIDEBAR_CONTENT_INDENT: f32 = 12.0;
 const SIDEBAR_PATH_MIN_WRAP_WIDTH: f32 = 48.0;
 const EDITOR_GUTTER_WIDTH: f32 = 72.0;
@@ -44,6 +52,7 @@ const MAX_EDITOR_FONT_SIZE: f32 = 32.0;
 const INLINE_EDITOR_ID_SOURCE: &str = "inline_editor";
 const WRAP_MEASURE_OVERSCAN_LINES: usize = 64;
 const SEARCH_RESULT_LIMIT: usize = 200;
+const HIGHLIGHT_SEARCH_LIMIT: usize = 1_000;
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
@@ -259,9 +268,30 @@ enum ShortcutAction {
     RunSearch,
     ToggleWrap,
     ToggleHelp,
+    AddNextOccurrence,
+    SelectAllOccurrences,
+    SelectLines,
+    RectangularSelection,
+    CopyRectangle,
+    PasteRectangle,
+    MoveLineUp,
+    MoveLineDown,
+    CopyLineUp,
+    CopyLineDown,
+    DeleteLine,
+    Uppercase,
+    Lowercase,
+    ClearMultiCursor,
     ZoomIn,
     ZoomOut,
     ResetZoom,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum InlineInputEdit {
+    Insert(String),
+    Backspace,
+    Delete,
 }
 
 struct PhantomApp {
@@ -276,7 +306,10 @@ struct PhantomApp {
     go_to_line: GoToLineState,
     show_help: bool,
     editor_font_size: f32,
-    pending_inline_cursor: Option<usize>,
+    current_inline_selection: Option<TextSelection>,
+    inline_selections: Vec<TextSelection>,
+    pending_inline_selection: Option<TextSelection>,
+    rectangular_clipboard: Option<String>,
     open_receiver: Option<Receiver<OpenTaskResult>>,
     save_receiver: Option<Receiver<SaveTaskResult>>,
     viewport_receiver: Option<Receiver<ViewportTaskResult>>,
@@ -296,7 +329,10 @@ impl Default for PhantomApp {
             go_to_line: GoToLineState::default(),
             show_help: false,
             editor_font_size: DEFAULT_EDITOR_FONT_SIZE,
-            pending_inline_cursor: None,
+            current_inline_selection: None,
+            inline_selections: Vec::new(),
+            pending_inline_selection: None,
+            rectangular_clipboard: None,
             open_receiver: None,
             save_receiver: None,
             viewport_receiver: None,
@@ -312,6 +348,7 @@ impl eframe::App for PhantomApp {
         self.guard_close_request(context);
         self.handle_dropped_files(context);
         self.handle_keyboard_shortcuts(context);
+        self.handle_inline_multi_cursor_input(context);
         context.send_viewport_cmd(egui::ViewportCommand::Title(self.document.window_title()));
 
         self.show_menu_bar(context);
@@ -392,6 +429,7 @@ impl PhantomApp {
                     .map(|path| path.display().to_string())
                     .unwrap_or_default();
                 self.wrap_line_heights.clear();
+                self.clear_inline_edit_state();
                 self.document = ActiveDocument::Inline(document);
                 self.message = AppMessage::Info("Opened".to_owned());
             }
@@ -404,6 +442,7 @@ impl PhantomApp {
                     document.bytes()
                 ));
                 self.wrap_line_heights.clear();
+                self.clear_inline_edit_state();
                 self.document = ActiveDocument::Large(document);
             }
             OpenTaskResult::Failed { path, error } => {
@@ -465,6 +504,48 @@ impl PhantomApp {
         }
     }
 
+    fn handle_inline_multi_cursor_input(&mut self, context: &egui::Context) {
+        if self.inline_selections.is_empty() || !matches!(self.document, ActiveDocument::Inline(_))
+        {
+            return;
+        }
+
+        let edits = take_multi_cursor_text_edits(context);
+
+        for edit in edits {
+            let ActiveDocument::Inline(document) = &self.document else {
+                return;
+            };
+            let result = match edit {
+                InlineInputEdit::Insert(text) => {
+                    editor_ops::replace_selections(document.text(), &self.inline_selections, &text)
+                }
+                InlineInputEdit::Backspace => {
+                    let targets =
+                        editor_ops::backspace_targets(document.text(), &self.inline_selections);
+
+                    if targets.is_empty() {
+                        continue;
+                    }
+
+                    editor_ops::replace_selections(document.text(), &targets, "")
+                }
+                InlineInputEdit::Delete => {
+                    let targets =
+                        editor_ops::delete_targets(document.text(), &self.inline_selections);
+
+                    if targets.is_empty() {
+                        continue;
+                    }
+
+                    editor_ops::replace_selections(document.text(), &targets, "")
+                }
+            };
+
+            self.apply_inline_edit_result(result, "Edited multi-cursor selection(s)");
+        }
+    }
+
     fn apply_shortcut_action(&mut self, action: ShortcutAction, context: &egui::Context) {
         match action {
             ShortcutAction::New => self.new_document(),
@@ -480,6 +561,20 @@ impl PhantomApp {
                     self.run_search();
                 }
             }
+            ShortcutAction::AddNextOccurrence => self.add_next_occurrence_selection(),
+            ShortcutAction::SelectAllOccurrences => self.select_all_occurrences(),
+            ShortcutAction::SelectLines => self.select_current_lines(),
+            ShortcutAction::RectangularSelection => self.create_rectangular_selection(),
+            ShortcutAction::CopyRectangle => self.copy_rectangular_selection(),
+            ShortcutAction::PasteRectangle => self.paste_rectangular_selection(),
+            ShortcutAction::MoveLineUp => self.move_selected_lines(true),
+            ShortcutAction::MoveLineDown => self.move_selected_lines(false),
+            ShortcutAction::CopyLineUp => self.copy_selected_lines(true),
+            ShortcutAction::CopyLineDown => self.copy_selected_lines(false),
+            ShortcutAction::DeleteLine => self.delete_selected_lines(),
+            ShortcutAction::Uppercase => self.convert_selected_case(CaseTransform::Upper),
+            ShortcutAction::Lowercase => self.convert_selected_case(CaseTransform::Lower),
+            ShortcutAction::ClearMultiCursor => self.clear_multi_cursor(),
             ShortcutAction::ToggleWrap => {
                 self.wrap_lines = !self.wrap_lines;
                 self.wrap_line_heights.invalidate_measurements();
@@ -542,7 +637,10 @@ impl PhantomApp {
         self.go_to_line.error = None;
 
         if let ActiveDocument::Inline(document) = &self.document {
-            self.pending_inline_cursor = Some(line_start_char_index(document.text(), line_index));
+            self.pending_inline_selection = Some(TextSelection::cursor(line_start_char_index(
+                document.text(),
+                line_index,
+            )));
             self.message = AppMessage::Info(format!("Moved cursor to line {}", line_index + 1));
         } else {
             self.move_large_viewport_to_line(line_index);
@@ -563,6 +661,244 @@ impl PhantomApp {
         self.editor_font_size = DEFAULT_EDITOR_FONT_SIZE;
         self.wrap_line_heights.invalidate_measurements();
         self.message = AppMessage::Info(format!("Editor zoom {}px", self.editor_font_size));
+    }
+
+    fn clear_inline_edit_state(&mut self) {
+        self.current_inline_selection = None;
+        self.inline_selections.clear();
+        self.pending_inline_selection = None;
+        self.rectangular_clipboard = None;
+    }
+
+    fn active_inline_selections(&self) -> Vec<TextSelection> {
+        if !self.inline_selections.is_empty() {
+            return self.inline_selections.clone();
+        }
+
+        self.current_inline_selection
+            .map(|selection| vec![selection])
+            .unwrap_or_else(|| vec![TextSelection::cursor(0)])
+    }
+
+    fn set_inline_selections(
+        &mut self,
+        selections: Vec<TextSelection>,
+        message: impl Into<String>,
+    ) {
+        let selections = editor_ops::normalize_selections(&selections);
+
+        self.pending_inline_selection = selections.last().copied();
+        self.current_inline_selection = self.pending_inline_selection;
+        self.inline_selections = selections;
+        self.message = AppMessage::Info(message.into());
+    }
+
+    fn apply_inline_edit_result(
+        &mut self,
+        result: editor_ops::EditResult,
+        message: impl Into<String>,
+    ) {
+        let ActiveDocument::Inline(document) = &mut self.document else {
+            self.message =
+                AppMessage::Error("This command is available for inline documents".to_owned());
+            return;
+        };
+
+        document.replace_text(result.text);
+        self.set_inline_selections(result.selections, message);
+    }
+
+    fn add_next_occurrence_selection(&mut self) {
+        let ActiveDocument::Inline(document) = &self.document else {
+            self.message =
+                AppMessage::Error("Multi-cursor is available for inline documents".to_owned());
+            return;
+        };
+        let mut selections = self.active_inline_selections();
+
+        if selections.len() == 1 && selections[0].is_cursor() {
+            if let Some(word_selection) = editor_ops::word_at(document.text(), selections[0].head) {
+                selections[0] = word_selection;
+            }
+        }
+
+        let next = editor_ops::add_next_occurrence(document.text(), &selections);
+        let count = next.len();
+
+        self.set_inline_selections(next, format!("{count} cursor/selection target(s)"));
+    }
+
+    fn select_all_occurrences(&mut self) {
+        let ActiveDocument::Inline(document) = &self.document else {
+            self.message =
+                AppMessage::Error("Multi-cursor is available for inline documents".to_owned());
+            return;
+        };
+        let selection = self
+            .active_inline_selections()
+            .last()
+            .copied()
+            .and_then(|selection| {
+                if selection.is_cursor() {
+                    editor_ops::word_at(document.text(), selection.head)
+                } else {
+                    Some(selection)
+                }
+            });
+
+        let Some(selection) = selection else {
+            self.message =
+                AppMessage::Error("Select text or place the cursor on a word".to_owned());
+            return;
+        };
+
+        let selections = editor_ops::select_all_occurrences(document.text(), selection);
+        let count = selections.len();
+
+        self.set_inline_selections(selections, format!("Selected {count} occurrence(s)"));
+    }
+
+    fn select_current_lines(&mut self) {
+        let ActiveDocument::Inline(document) = &self.document else {
+            self.message =
+                AppMessage::Error("Line selection is available for inline documents".to_owned());
+            return;
+        };
+        let selections =
+            editor_ops::select_current_lines(document.text(), &self.active_inline_selections());
+
+        self.set_inline_selections(selections, "Selected line range");
+    }
+
+    fn create_rectangular_selection(&mut self) {
+        let ActiveDocument::Inline(document) = &self.document else {
+            self.message = AppMessage::Error(
+                "Rectangular selection is available for inline documents".to_owned(),
+            );
+            return;
+        };
+        let Some(selection) = self.current_inline_selection else {
+            self.message = AppMessage::Error("Select a multi-line range first".to_owned());
+            return;
+        };
+
+        if selection.is_cursor() {
+            self.message = AppMessage::Error("Select a multi-line range first".to_owned());
+            return;
+        }
+
+        let selections = editor_ops::rectangular_selections(document.text(), selection);
+        let count = selections.len();
+
+        self.set_inline_selections(
+            selections,
+            format!("Rectangular selection: {count} line(s)"),
+        );
+    }
+
+    fn copy_rectangular_selection(&mut self) {
+        let ActiveDocument::Inline(document) = &self.document else {
+            self.message =
+                AppMessage::Error("Rectangular copy is available for inline documents".to_owned());
+            return;
+        };
+        let selections = self.active_inline_selections();
+
+        self.rectangular_clipboard =
+            Some(editor_ops::rectangular_text(document.text(), &selections));
+        self.message = AppMessage::Info(format!(
+            "Copied rectangle from {} line(s)",
+            selections.len()
+        ));
+    }
+
+    fn paste_rectangular_selection(&mut self) {
+        let Some(block) = self.rectangular_clipboard.clone() else {
+            self.message = AppMessage::Error("Copy a rectangle before pasting it".to_owned());
+            return;
+        };
+        let ActiveDocument::Inline(document) = &self.document else {
+            self.message =
+                AppMessage::Error("Rectangular paste is available for inline documents".to_owned());
+            return;
+        };
+        let result = editor_ops::paste_rectangular(
+            document.text(),
+            &self.active_inline_selections(),
+            &block,
+        );
+
+        self.apply_inline_edit_result(result, "Pasted rectangle");
+    }
+
+    fn move_selected_lines(&mut self, up: bool) {
+        let ActiveDocument::Inline(document) = &self.document else {
+            self.message =
+                AppMessage::Error("Line move is available for inline documents".to_owned());
+            return;
+        };
+        let result = editor_ops::move_lines(document.text(), &self.active_inline_selections(), up);
+
+        self.apply_inline_edit_result(
+            result,
+            if up {
+                "Moved line(s) up"
+            } else {
+                "Moved line(s) down"
+            },
+        );
+    }
+
+    fn copy_selected_lines(&mut self, up: bool) {
+        let ActiveDocument::Inline(document) = &self.document else {
+            self.message =
+                AppMessage::Error("Line copy is available for inline documents".to_owned());
+            return;
+        };
+        let result = editor_ops::copy_lines(document.text(), &self.active_inline_selections(), up);
+
+        self.apply_inline_edit_result(
+            result,
+            if up {
+                "Copied line(s) up"
+            } else {
+                "Copied line(s) down"
+            },
+        );
+    }
+
+    fn delete_selected_lines(&mut self) {
+        let ActiveDocument::Inline(document) = &self.document else {
+            self.message =
+                AppMessage::Error("Line delete is available for inline documents".to_owned());
+            return;
+        };
+        let result = editor_ops::delete_lines(document.text(), &self.active_inline_selections());
+
+        self.apply_inline_edit_result(result, "Deleted line(s)");
+    }
+
+    fn convert_selected_case(&mut self, transform: CaseTransform) {
+        let ActiveDocument::Inline(document) = &self.document else {
+            self.message =
+                AppMessage::Error("Case conversion is available for inline documents".to_owned());
+            return;
+        };
+        let result =
+            editor_ops::convert_case(document.text(), &self.active_inline_selections(), transform);
+        let message = match transform {
+            CaseTransform::Upper => "Converted to uppercase",
+            CaseTransform::Lower => "Converted to lowercase",
+        };
+
+        self.apply_inline_edit_result(result, message);
+    }
+
+    fn clear_multi_cursor(&mut self) {
+        let selection = self.current_inline_selection;
+        self.inline_selections.clear();
+        self.pending_inline_selection = selection;
+        self.message = AppMessage::Info("Cleared multi-cursor selections".to_owned());
     }
 
     fn show_menu_bar(&mut self, context: &egui::Context) {
@@ -603,6 +939,66 @@ impl PhantomApp {
                             }
                             if ui.button("Go to Line...").clicked() {
                                 self.open_go_to_line();
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui.button("Add Cursor to Next Match").clicked() {
+                                self.add_next_occurrence_selection();
+                                ui.close_menu();
+                            }
+                            if ui.button("Select All Occurrences").clicked() {
+                                self.select_all_occurrences();
+                                ui.close_menu();
+                            }
+                            if ui.button("Select Current Lines").clicked() {
+                                self.select_current_lines();
+                                ui.close_menu();
+                            }
+                            if ui.button("Clear Multi-Cursor").clicked() {
+                                self.clear_multi_cursor();
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui.button("Rectangular Selection").clicked() {
+                                self.create_rectangular_selection();
+                                ui.close_menu();
+                            }
+                            if ui.button("Copy Rectangle").clicked() {
+                                self.copy_rectangular_selection();
+                                ui.close_menu();
+                            }
+                            if ui.button("Paste Rectangle").clicked() {
+                                self.paste_rectangular_selection();
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui.button("Move Line Up").clicked() {
+                                self.move_selected_lines(true);
+                                ui.close_menu();
+                            }
+                            if ui.button("Move Line Down").clicked() {
+                                self.move_selected_lines(false);
+                                ui.close_menu();
+                            }
+                            if ui.button("Copy Line Up").clicked() {
+                                self.copy_selected_lines(true);
+                                ui.close_menu();
+                            }
+                            if ui.button("Copy Line Down").clicked() {
+                                self.copy_selected_lines(false);
+                                ui.close_menu();
+                            }
+                            if ui.button("Delete Line").clicked() {
+                                self.delete_selected_lines();
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui.button("Uppercase").clicked() {
+                                self.convert_selected_case(CaseTransform::Upper);
+                                ui.close_menu();
+                            }
+                            if ui.button("Lowercase").clicked() {
+                                self.convert_selected_case(CaseTransform::Lower);
                                 ui.close_menu();
                             }
                         });
@@ -1053,7 +1449,12 @@ impl PhantomApp {
                 }
 
                 let editor_font_size = self.editor_font_size;
-                let pending_inline_cursor = &mut self.pending_inline_cursor;
+                let search_query = self.search.query.clone();
+                let search_options = self.search.options();
+                let current_inline_selection_snapshot = self.current_inline_selection;
+                let inline_selections_snapshot = self.inline_selections.clone();
+                let pending_inline_selection = &mut self.pending_inline_selection;
+                let current_inline_selection = &mut self.current_inline_selection;
                 let large_editor_action = match &mut self.document {
                     ActiveDocument::Inline(document) => {
                         let wrap_lines = self.wrap_lines;
@@ -1062,6 +1463,11 @@ impl PhantomApp {
                             document.text(),
                             available_width,
                             wrap_lines,
+                            editor_font_size,
+                        );
+                        let editor_min_height = inline_editor_min_height(
+                            ui.available_height(),
+                            document.metrics().visual_lines,
                             editor_font_size,
                         );
                         let scroll_area = if wrap_lines {
@@ -1073,23 +1479,49 @@ impl PhantomApp {
                         scroll_area.auto_shrink([false, false]).show(ui, |ui| {
                             ui.set_min_width(editor_width);
                             let editor_id = ui.make_persistent_id(INLINE_EDITOR_ID_SOURCE);
-                            let focus_editor = apply_inline_cursor_request(
+                            let focus_editor = apply_inline_selection_request(
                                 ui.ctx(),
                                 editor_id,
-                                pending_inline_cursor.take(),
+                                pending_inline_selection.take(),
                             );
-                            let editor =
-                                editor_widget(document.text_mut(), editor_width, editor_font_size)
-                                    .id(editor_id);
+                            let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
+                                ui.fonts(|fonts| {
+                                    fonts.layout_job(editor_highlight_layout_job(
+                                        text,
+                                        wrap_width,
+                                        editor_font_size,
+                                        &search_query,
+                                        search_options,
+                                        current_inline_selection_snapshot,
+                                        &inline_selections_snapshot,
+                                    ))
+                                })
+                            };
+                            let editor = editor_widget(
+                                document.text_mut(),
+                                editor_width,
+                                editor_min_height,
+                                editor_font_size,
+                            )
+                            .id(editor_id)
+                            .layouter(&mut layouter);
 
-                            let response = ui.add_sized(ui.available_size(), editor);
+                            let output = editor.show(ui);
 
                             if focus_editor {
-                                response.request_focus();
+                                output.response.request_focus();
                             }
 
-                            if response.changed() {
+                            if output.response.changed() {
                                 document.record_text_change();
+                            }
+
+                            if let Some(cursor_range) = output.cursor_range {
+                                let cursor_range = cursor_range.as_ccursor_range();
+                                *current_inline_selection = Some(TextSelection::new(
+                                    cursor_range.secondary.index,
+                                    cursor_range.primary.index,
+                                ));
                             }
                         });
                         None
@@ -1099,6 +1531,8 @@ impl PhantomApp {
                         document,
                         self.wrap_lines,
                         editor_font_size,
+                        &self.search.query,
+                        self.search.options(),
                         &mut self.wrap_line_heights,
                     ),
                 };
@@ -1192,6 +1626,13 @@ impl PhantomApp {
                 help_row(ui, "Save As", "Cmd/Ctrl+Shift+S");
                 help_row(ui, "Find", "Cmd/Ctrl+F, F3");
                 help_row(ui, "Go to Line", "Cmd/Ctrl+G");
+                help_row(ui, "Add Cursor", "Cmd/Ctrl+D");
+                help_row(ui, "Select Occurrences", "Cmd/Ctrl+Shift+L");
+                help_row(ui, "Select Lines", "Cmd/Ctrl+L");
+                help_row(ui, "Move/Copy Lines", "Alt+Up/Down, Alt+Shift+Up/Down");
+                help_row(ui, "Delete Line", "Cmd/Ctrl+Shift+K");
+                help_row(ui, "Case", "Cmd/Ctrl+U, Cmd/Ctrl+Shift+U");
+                help_row(ui, "Rectangle", "Alt+Shift+R/C/V");
                 help_row(ui, "Wrap Lines", "Alt+Z");
                 help_row(ui, "Zoom", "Cmd/Ctrl+Plus, Minus, 0");
                 help_row(ui, "Help", "F1");
@@ -1245,6 +1686,13 @@ impl PhantomApp {
                         ui.add_space(12.0);
                         ui.label(status_text(format!("{}px", self.editor_font_size)));
                         ui.add_space(12.0);
+                        if !self.inline_selections.is_empty() {
+                            ui.label(status_text(format!(
+                                "{} selections",
+                                self.inline_selections.len()
+                            )));
+                            ui.add_space(12.0);
+                        }
                         ui.label(status_text(self.message.text()));
                     });
                 });
@@ -1260,6 +1708,7 @@ impl PhantomApp {
         self.save_receiver = None;
         self.viewport_receiver = None;
         self.wrap_line_heights.clear();
+        self.clear_inline_edit_state();
         self.document = ActiveDocument::default();
         self.path_input.clear();
         self.message = AppMessage::Info("New document".to_owned());
@@ -1550,6 +1999,8 @@ fn show_large_virtual_editor(
     document: &mut LargeDocument,
     wrap_lines: bool,
     editor_font_size: f32,
+    search_query: &str,
+    search_options: SearchOptions,
     wrap_line_heights: &mut WrapLineHeightCache,
 ) -> Option<LargeEditorAction> {
     ui.horizontal(|ui| {
@@ -1615,50 +2066,75 @@ fn show_large_virtual_editor(
         return action;
     }
 
-    egui::ScrollArea::both()
-        .auto_shrink([false, false])
-        .show_rows(ui, row_height, line_count, |ui, row_range| {
-            ui.set_min_width(content_width);
+    ui.scope(|ui| {
+        configure_large_non_wrapped_row_spacing(ui);
 
-            if action.is_none() {
-                if let Some(line_index) =
-                    first_missing_visible_line(row_range.clone(), |line_index| {
-                        document.contains_file_line(line_index)
-                    })
-                {
-                    action = Some(LargeEditorAction::LoadLine(line_index));
+        egui::ScrollArea::both()
+            .auto_shrink([false, false])
+            .show_rows(ui, row_height, line_count, |ui, row_range| {
+                ui.set_min_width(content_width);
+
+                if action.is_none() {
+                    if let Some(line_index) =
+                        first_missing_visible_line(row_range.clone(), |line_index| {
+                            document.contains_file_line(line_index)
+                        })
+                    {
+                        action = Some(LargeEditorAction::LoadLine(line_index));
+                    }
                 }
-            }
 
-            if !document.contains_file_line(row_range.start) {
+                if !document.contains_file_line(row_range.start) {
+                    for line_index in row_range {
+                        show_loading_line(ui, line_index, row_height, text_width);
+                    }
+
+                    return;
+                }
+
+                if document.contains_file_line_range(row_range.clone()) {
+                    action = show_virtual_line_block(
+                        ui,
+                        document,
+                        row_range,
+                        LargeLineBlockView {
+                            row_height,
+                            text_width,
+                            editor_font_size,
+                            search_query,
+                            search_options,
+                        },
+                    );
+
+                    return;
+                }
+
                 for line_index in row_range {
-                    show_loading_line(ui, line_index, row_height, text_width);
-                }
+                    if !document.contains_file_line(line_index) {
+                        show_loading_line(ui, line_index, row_height, text_width);
+                        continue;
+                    }
 
-                return;
-            }
-
-            for line_index in row_range {
-                if !document.contains_file_line(line_index) {
-                    show_loading_line(ui, line_index, row_height, text_width);
-                    continue;
+                    if let Some(line_message) = show_virtual_line(
+                        ui,
+                        document,
+                        line_index,
+                        row_height,
+                        text_width,
+                        wrap_lines,
+                        editor_font_size,
+                    ) {
+                        action = Some(LargeEditorAction::Message(line_message));
+                    }
                 }
-
-                if let Some(line_message) = show_virtual_line(
-                    ui,
-                    document,
-                    line_index,
-                    row_height,
-                    text_width,
-                    wrap_lines,
-                    editor_font_size,
-                ) {
-                    action = Some(LargeEditorAction::Message(line_message));
-                }
-            }
-        });
+            });
+    });
 
     action
+}
+
+fn configure_large_non_wrapped_row_spacing(ui: &mut egui::Ui) {
+    ui.spacing_mut().item_spacing.y = 0.0;
 }
 
 struct WrappedRowsGeometry {
@@ -1993,6 +2469,145 @@ fn show_loading_line(ui: &mut egui::Ui, line_index: usize, row_height: f32, text
     });
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LargeLineBlockView<'a> {
+    row_height: f32,
+    text_width: f32,
+    editor_font_size: f32,
+    search_query: &'a str,
+    search_options: SearchOptions,
+}
+
+fn show_virtual_line_block(
+    ui: &mut egui::Ui,
+    document: &mut LargeDocument,
+    row_range: Range<usize>,
+    view: LargeLineBlockView<'_>,
+) -> Option<LargeEditorAction> {
+    let line_count = row_range.end.saturating_sub(row_range.start);
+
+    if line_count == 0 {
+        return None;
+    }
+
+    let mut message = None;
+    let mut block_text = row_range
+        .clone()
+        .map(|line_index| document.file_line_text(line_index).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let block_height = view.row_height * line_count as f32;
+
+    ui.horizontal(|ui| {
+        let (line_number_rect, _) =
+            ui.allocate_exact_size(Vec2::new(EDITOR_GUTTER_WIDTH, block_height), Sense::hover());
+
+        for (offset, line_index) in row_range.clone().enumerate() {
+            let number_rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    line_number_rect.left(),
+                    line_number_rect.top() + offset as f32 * view.row_height,
+                ),
+                Vec2::new(EDITOR_GUTTER_WIDTH, view.row_height),
+            );
+            ui.painter().text(
+                line_number_top_pos(number_rect),
+                Align2::RIGHT_TOP,
+                (line_index + 1).to_string(),
+                FontId::new(12.0, FontFamily::Monospace),
+                VSCODE_TEXT_DIM,
+            );
+        }
+
+        ui.add_space(EDITOR_GUTTER_GAP);
+
+        let editor_id = ui.make_persistent_id((
+            "large_line_block_editor",
+            document.path(),
+            row_range.start,
+            row_range.end,
+        ));
+        let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
+            ui.fonts(|fonts| {
+                fonts.layout_job(editor_highlight_layout_job(
+                    text,
+                    large_line_block_layout_width(wrap_width, view.text_width),
+                    view.editor_font_size,
+                    view.search_query,
+                    view.search_options,
+                    None,
+                    &[],
+                ))
+            })
+        };
+        let response = ui.add_sized(
+            Vec2::new(view.text_width, block_height),
+            TextEdit::multiline(&mut block_text)
+                .id(editor_id)
+                .font(editor_font_id(view.editor_font_size))
+                .text_color(VSCODE_TEXT)
+                .desired_width(view.text_width)
+                .desired_rows(line_count)
+                .min_size(Vec2::new(view.text_width, block_height))
+                .lock_focus(true)
+                .margin(Margin::ZERO)
+                .frame(false)
+                .layouter(&mut layouter),
+        );
+
+        if response.changed() {
+            message = apply_large_line_block_edit(document, row_range.clone(), &block_text);
+        }
+    });
+
+    message.map(LargeEditorAction::Message)
+}
+
+fn large_line_block_layout_width(provided_wrap_width: f32, text_width: f32) -> f32 {
+    if text_width.is_finite() {
+        text_width.max(provided_wrap_width)
+    } else {
+        provided_wrap_width
+    }
+}
+
+fn apply_large_line_block_edit(
+    document: &mut LargeDocument,
+    row_range: Range<usize>,
+    block_text: &str,
+) -> Option<AppMessage> {
+    let edited_lines = block_text.split('\n').collect::<Vec<_>>();
+    let expected_line_count = row_range.end.saturating_sub(row_range.start);
+
+    if edited_lines.len() != expected_line_count {
+        return Some(AppMessage::Error(
+            "Large viewport block edits must keep the same line count".to_owned(),
+        ));
+    }
+
+    for line_index in row_range.clone() {
+        if !document.is_file_line_editable(line_index) {
+            return Some(AppMessage::Error(
+                "The visible block includes a partial viewport boundary line".to_owned(),
+            ));
+        }
+    }
+
+    let mut changed = false;
+
+    for (line_index, replacement) in row_range.zip(edited_lines) {
+        let mut replacement = replacement.to_owned();
+        remove_line_breaks(&mut replacement);
+
+        match document.replace_file_line(line_index, &replacement) {
+            Ok(line_changed) => changed |= line_changed,
+            Err(error) => return Some(AppMessage::Error(format!("Edit failed: {error}"))),
+        }
+    }
+
+    changed.then(|| AppMessage::Info("Edited visible line block".to_owned()))
+}
+
 fn show_virtual_line(
     ui: &mut egui::Ui,
     document: &mut LargeDocument,
@@ -2107,6 +2722,387 @@ fn path_label_layout_job(path_text: &str, wrap_width: f32) -> LayoutJob {
     layout_job
 }
 
+#[derive(Debug, Clone)]
+struct HighlightRange {
+    range: Range<usize>,
+    foreground: Option<Color32>,
+    background: Option<Color32>,
+}
+
+fn editor_highlight_layout_job(
+    text: &str,
+    wrap_width: f32,
+    editor_font_size: f32,
+    search_query: &str,
+    search_options: SearchOptions,
+    primary_selection: Option<TextSelection>,
+    multi_selections: &[TextSelection],
+) -> LayoutJob {
+    let mut ranges = syntax_highlight_ranges(text);
+    ranges.extend(search_highlight_ranges(text, search_query, search_options));
+    ranges.extend(word_highlight_ranges(text, primary_selection));
+    ranges.extend(selection_highlight_ranges(text, multi_selections));
+    ranges.extend(bracket_highlight_ranges(text, primary_selection));
+
+    let mut boundaries = vec![0, text.len()];
+    for highlight in &ranges {
+        boundaries.push(highlight.range.start.min(text.len()));
+        boundaries.push(highlight.range.end.min(text.len()));
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    boundaries.retain(|boundary| text.is_char_boundary(*boundary));
+
+    let mut layout_job = LayoutJob::default();
+    layout_job.wrap.max_width = wrap_width.max(EDITOR_MIN_WRAP_TEXT_WIDTH);
+    layout_job.wrap.break_anywhere = true;
+
+    for boundary_pair in boundaries.windows(2) {
+        let start = boundary_pair[0];
+        let end = boundary_pair[1];
+
+        if start == end {
+            continue;
+        }
+
+        let foreground = ranges
+            .iter()
+            .find(|highlight| {
+                highlight.foreground.is_some()
+                    && highlight.range.start <= start
+                    && end <= highlight.range.end
+            })
+            .and_then(|highlight| highlight.foreground)
+            .unwrap_or(VSCODE_TEXT);
+        let background = ranges
+            .iter()
+            .rev()
+            .find(|highlight| {
+                highlight.background.is_some()
+                    && highlight.range.start <= start
+                    && end <= highlight.range.end
+            })
+            .and_then(|highlight| highlight.background);
+        let mut format = TextFormat::simple(editor_font_id(editor_font_size), foreground);
+        format.line_height = Some(editor_row_height(editor_font_size));
+
+        if let Some(background) = background {
+            format.background = background;
+        }
+
+        layout_job.append(&text[start..end], 0.0, format);
+    }
+
+    layout_job
+}
+
+fn syntax_highlight_ranges(text: &str) -> Vec<HighlightRange> {
+    let mut ranges = Vec::new();
+    let mut iterator = text.char_indices().peekable();
+
+    while let Some((start, character)) = iterator.next() {
+        if character == '"' {
+            let mut end = start + character.len_utf8();
+            let mut escaped = false;
+
+            for (index, next_character) in iterator.by_ref() {
+                end = index + next_character.len_utf8();
+
+                if escaped {
+                    escaped = false;
+                } else if next_character == '\\' {
+                    escaped = true;
+                } else if next_character == '"' {
+                    break;
+                }
+            }
+
+            ranges.push(HighlightRange {
+                range: start..end,
+                foreground: Some(SYNTAX_STRING),
+                background: None,
+            });
+        } else if character == '/' && iterator.peek().is_some_and(|(_, next)| *next == '/') {
+            let mut end = text.len();
+
+            for (index, next_character) in iterator.by_ref() {
+                if next_character == '\n' {
+                    end = index;
+                    break;
+                }
+            }
+
+            ranges.push(HighlightRange {
+                range: start..end,
+                foreground: Some(SYNTAX_COMMENT),
+                background: None,
+            });
+        } else if character.is_ascii_digit() {
+            let mut end = start + character.len_utf8();
+
+            while let Some((index, next_character)) = iterator.peek().copied() {
+                if next_character.is_ascii_digit()
+                    || matches!(next_character, '.' | '_' | 'e' | 'E' | '-' | '+')
+                {
+                    iterator.next();
+                    end = index + next_character.len_utf8();
+                } else {
+                    break;
+                }
+            }
+
+            ranges.push(HighlightRange {
+                range: start..end,
+                foreground: Some(SYNTAX_NUMBER),
+                background: None,
+            });
+        } else if is_identifier_start(character) {
+            let mut end = start + character.len_utf8();
+            let mut word = String::from(character);
+
+            while let Some((index, next_character)) = iterator.peek().copied() {
+                if is_identifier_continue(next_character) {
+                    iterator.next();
+                    word.push(next_character);
+                    end = index + next_character.len_utf8();
+                } else {
+                    break;
+                }
+            }
+
+            if is_syntax_keyword(&word) {
+                ranges.push(HighlightRange {
+                    range: start..end,
+                    foreground: Some(SYNTAX_KEYWORD),
+                    background: None,
+                });
+            }
+        } else if matches!(character, '{' | '}' | '[' | ']' | '(' | ')') {
+            ranges.push(HighlightRange {
+                range: start..start + character.len_utf8(),
+                foreground: Some(SYNTAX_BRACKET),
+                background: None,
+            });
+        }
+    }
+
+    ranges
+}
+
+fn search_highlight_ranges(
+    text: &str,
+    search_query: &str,
+    search_options: SearchOptions,
+) -> Vec<HighlightRange> {
+    if search_query.is_empty() {
+        return Vec::new();
+    }
+
+    find_text_matches(text, search_query, search_options, HIGHLIGHT_SEARCH_LIMIT)
+        .map(|matches| {
+            matches
+                .into_iter()
+                .map(|search_match| HighlightRange {
+                    range: search_match.range,
+                    foreground: None,
+                    background: Some(VSCODE_HIGHLIGHT),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn selection_highlight_ranges(text: &str, selections: &[TextSelection]) -> Vec<HighlightRange> {
+    let character_count = text.chars().count();
+
+    selections
+        .iter()
+        .copied()
+        .filter(|selection| !selection.is_cursor())
+        .filter(|selection| {
+            selection.start() <= character_count && selection.end() <= character_count
+        })
+        .map(|selection| HighlightRange {
+            range: editor_ops::char_to_byte_index(text, selection.start())
+                ..editor_ops::char_to_byte_index(text, selection.end()),
+            foreground: None,
+            background: Some(VSCODE_SELECTION_HIGHLIGHT),
+        })
+        .collect()
+}
+
+fn word_highlight_ranges(
+    text: &str,
+    primary_selection: Option<TextSelection>,
+) -> Vec<HighlightRange> {
+    let Some(selection) = primary_selection else {
+        return Vec::new();
+    };
+    let selection = if selection.is_cursor() {
+        editor_ops::word_at(text, selection.head)
+    } else {
+        Some(selection)
+    };
+    let Some(selection) = selection else {
+        return Vec::new();
+    };
+    let word = editor_ops::selected_text(text, selection);
+
+    if word.is_empty() {
+        return Vec::new();
+    }
+
+    editor_ops::select_all_occurrences(text, selection)
+        .into_iter()
+        .filter(|candidate| editor_ops::selected_text(text, *candidate) == word)
+        .map(|candidate| HighlightRange {
+            range: editor_ops::char_to_byte_index(text, candidate.start())
+                ..editor_ops::char_to_byte_index(text, candidate.end()),
+            foreground: None,
+            background: Some(Color32::from_rgb(0x33, 0x3f, 0x4f)),
+        })
+        .collect()
+}
+
+fn bracket_highlight_ranges(
+    text: &str,
+    primary_selection: Option<TextSelection>,
+) -> Vec<HighlightRange> {
+    let Some(selection) = primary_selection else {
+        return Vec::new();
+    };
+    let Some((left, right)) = matching_bracket_pair(text, selection.head) else {
+        return Vec::new();
+    };
+
+    [left, right]
+        .into_iter()
+        .map(|index| HighlightRange {
+            range: editor_ops::char_to_byte_index(text, index)
+                ..editor_ops::char_to_byte_index(text, index + 1),
+            foreground: Some(Color32::WHITE),
+            background: Some(VSCODE_ACCENT),
+        })
+        .collect()
+}
+
+fn matching_bracket_pair(text: &str, cursor: usize) -> Option<(usize, usize)> {
+    let characters = text.chars().collect::<Vec<_>>();
+
+    if characters.is_empty() {
+        return None;
+    }
+
+    let candidate = if cursor < characters.len() && is_bracket(characters[cursor]) {
+        cursor
+    } else if cursor > 0 && is_bracket(characters[cursor - 1]) {
+        cursor - 1
+    } else {
+        return None;
+    };
+    let bracket = characters[candidate];
+    let (matching, forward) = match bracket {
+        '(' => (')', true),
+        '[' => (']', true),
+        '{' => ('}', true),
+        ')' => ('(', false),
+        ']' => ('[', false),
+        '}' => ('{', false),
+        _ => return None,
+    };
+    let mut depth = 0;
+
+    if forward {
+        for (index, character) in characters.iter().copied().enumerate().skip(candidate) {
+            if character == bracket {
+                depth += 1;
+            } else if character == matching {
+                depth -= 1;
+
+                if depth == 0 {
+                    return Some((candidate, index));
+                }
+            }
+        }
+    } else {
+        for (index, character) in characters
+            .iter()
+            .copied()
+            .enumerate()
+            .take(candidate + 1)
+            .rev()
+        {
+            if character == bracket {
+                depth += 1;
+            } else if character == matching {
+                depth -= 1;
+
+                if depth == 0 {
+                    return Some((index, candidate));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn is_bracket(character: char) -> bool {
+    matches!(character, '(' | ')' | '[' | ']' | '{' | '}')
+}
+
+fn is_identifier_start(character: char) -> bool {
+    character == '_' || character.is_ascii_alphabetic()
+}
+
+fn is_identifier_continue(character: char) -> bool {
+    is_identifier_start(character) || character.is_ascii_digit()
+}
+
+fn is_syntax_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "as" | "async"
+            | "await"
+            | "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "const"
+            | "continue"
+            | "default"
+            | "else"
+            | "enum"
+            | "false"
+            | "fn"
+            | "for"
+            | "from"
+            | "function"
+            | "if"
+            | "impl"
+            | "import"
+            | "in"
+            | "let"
+            | "match"
+            | "mod"
+            | "mut"
+            | "null"
+            | "pub"
+            | "return"
+            | "self"
+            | "static"
+            | "struct"
+            | "switch"
+            | "true"
+            | "try"
+            | "type"
+            | "use"
+            | "var"
+            | "while"
+            | "where"
+    )
+}
+
 fn collect_shortcut_actions(context: &egui::Context) -> Vec<ShortcutAction> {
     let mut actions = Vec::new();
 
@@ -2132,6 +3128,33 @@ fn collect_shortcut_actions(context: &egui::Context) -> Vec<ShortcutAction> {
         if input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::G)) {
             actions.push(ShortcutAction::GoToLine);
         }
+        if input.consume_shortcut(&KeyboardShortcut::new(
+            Modifiers::COMMAND | Modifiers::SHIFT,
+            egui::Key::L,
+        )) {
+            actions.push(ShortcutAction::SelectAllOccurrences);
+        }
+        if input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::D)) {
+            actions.push(ShortcutAction::AddNextOccurrence);
+        }
+        if input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::L)) {
+            actions.push(ShortcutAction::SelectLines);
+        }
+        if input.consume_shortcut(&KeyboardShortcut::new(
+            Modifiers::COMMAND | Modifiers::SHIFT,
+            egui::Key::K,
+        )) {
+            actions.push(ShortcutAction::DeleteLine);
+        }
+        if input.consume_shortcut(&KeyboardShortcut::new(
+            Modifiers::COMMAND | Modifiers::SHIFT,
+            egui::Key::U,
+        )) {
+            actions.push(ShortcutAction::Lowercase);
+        }
+        if input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::U)) {
+            actions.push(ShortcutAction::Uppercase);
+        }
         if input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::Plus))
             || input.consume_shortcut(&KeyboardShortcut::new(
                 Modifiers::COMMAND,
@@ -2149,6 +3172,30 @@ fn collect_shortcut_actions(context: &egui::Context) -> Vec<ShortcutAction> {
         if input.consume_key(Modifiers::ALT, egui::Key::Z) {
             actions.push(ShortcutAction::ToggleWrap);
         }
+        if input.consume_key(Modifiers::ALT | Modifiers::SHIFT, egui::Key::ArrowUp) {
+            actions.push(ShortcutAction::CopyLineUp);
+        }
+        if input.consume_key(Modifiers::ALT | Modifiers::SHIFT, egui::Key::ArrowDown) {
+            actions.push(ShortcutAction::CopyLineDown);
+        }
+        if input.consume_key(Modifiers::ALT, egui::Key::ArrowUp) {
+            actions.push(ShortcutAction::MoveLineUp);
+        }
+        if input.consume_key(Modifiers::ALT, egui::Key::ArrowDown) {
+            actions.push(ShortcutAction::MoveLineDown);
+        }
+        if input.consume_key(Modifiers::ALT | Modifiers::SHIFT, egui::Key::R) {
+            actions.push(ShortcutAction::RectangularSelection);
+        }
+        if input.consume_key(Modifiers::ALT | Modifiers::SHIFT, egui::Key::C) {
+            actions.push(ShortcutAction::CopyRectangle);
+        }
+        if input.consume_key(Modifiers::ALT | Modifiers::SHIFT, egui::Key::V) {
+            actions.push(ShortcutAction::PasteRectangle);
+        }
+        if input.consume_key(Modifiers::NONE, egui::Key::Escape) {
+            actions.push(ShortcutAction::ClearMultiCursor);
+        }
         if input.consume_key(Modifiers::NONE, egui::Key::F1) {
             actions.push(ShortcutAction::ToggleHelp);
         }
@@ -2160,6 +3207,58 @@ fn collect_shortcut_actions(context: &egui::Context) -> Vec<ShortcutAction> {
     });
 
     actions
+}
+
+fn take_multi_cursor_text_edits(context: &egui::Context) -> Vec<InlineInputEdit> {
+    let mut edits = Vec::new();
+
+    context.input_mut(|input| {
+        let events = std::mem::take(&mut input.raw.events);
+
+        input.raw.events = events
+            .into_iter()
+            .filter_map(|event| match event {
+                egui::Event::Text(text) if !text.is_empty() => {
+                    edits.push(InlineInputEdit::Insert(text));
+                    None
+                }
+                egui::Event::Paste(text) if !text.is_empty() => {
+                    edits.push(InlineInputEdit::Insert(text));
+                    None
+                }
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if !modifiers.command && !modifiers.ctrl && !modifiers.mac_cmd => {
+                    edits.push(InlineInputEdit::Insert("\n".to_owned()));
+                    None
+                }
+                egui::Event::Key {
+                    key: egui::Key::Backspace,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if !modifiers.command && !modifiers.ctrl && !modifiers.mac_cmd => {
+                    edits.push(InlineInputEdit::Backspace);
+                    None
+                }
+                egui::Event::Key {
+                    key: egui::Key::Delete,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if !modifiers.command && !modifiers.ctrl && !modifiers.mac_cmd => {
+                    edits.push(InlineInputEdit::Delete);
+                    None
+                }
+                event => Some(event),
+            })
+            .collect();
+    });
+
+    edits
 }
 
 fn parse_go_to_line_index(input: &str, line_count: usize) -> Result<usize, String> {
@@ -2200,19 +3299,20 @@ fn line_start_char_index(text: &str, line_index: usize) -> usize {
     text.chars().count()
 }
 
-fn apply_inline_cursor_request(
+fn apply_inline_selection_request(
     context: &egui::Context,
     editor_id: egui::Id,
-    char_index: Option<usize>,
+    selection: Option<TextSelection>,
 ) -> bool {
-    let Some(char_index) = char_index else {
+    let Some(selection) = selection else {
         return false;
     };
 
     let mut state = TextEditState::load(context, editor_id).unwrap_or_default();
-    state
-        .cursor
-        .set_char_range(Some(CCursorRange::one(CCursor::new(char_index))));
+    state.cursor.set_char_range(Some(CCursorRange::two(
+        CCursor::new(selection.anchor),
+        CCursor::new(selection.head),
+    )));
     state.store(context, editor_id);
 
     true
@@ -2224,6 +3324,21 @@ fn editor_monospace_char_width(editor_font_size: f32) -> f32 {
 
 fn editor_row_height(editor_font_size: f32) -> f32 {
     (EDITOR_ROW_HEIGHT * editor_font_size / DEFAULT_EDITOR_FONT_SIZE).ceil()
+}
+
+fn inline_editor_min_height(
+    available_height: f32,
+    visual_lines: usize,
+    editor_font_size: f32,
+) -> f32 {
+    let row_height = editor_row_height(editor_font_size);
+    let document_height = visual_lines.max(1) as f32 * row_height;
+
+    if available_height.is_finite() {
+        available_height.max(document_height).ceil()
+    } else {
+        document_height.ceil()
+    }
 }
 
 fn longest_line_character_count(text: &str) -> usize {
@@ -2296,27 +3411,38 @@ fn editor_line_row_height_for_ui(
 }
 
 fn editor_line_layout_job(text: &str, wrap_width: f32, editor_font_size: f32) -> LayoutJob {
-    let mut layout_job = LayoutJob::single_section(
-        text.to_owned(),
-        TextFormat::simple(editor_font_id(editor_font_size), VSCODE_TEXT),
-    );
-    layout_job.wrap.max_width = wrap_width.max(EDITOR_MIN_WRAP_TEXT_WIDTH);
-    layout_job.wrap.break_anywhere = true;
-
-    layout_job
+    editor_highlight_layout_job(
+        text,
+        wrap_width,
+        editor_font_size,
+        "",
+        SearchOptions::default(),
+        None,
+        &[],
+    )
 }
 
 fn editor_font_id(editor_font_size: f32) -> FontId {
     FontId::new(editor_font_size, FontFamily::Monospace)
 }
 
-fn editor_widget(text: &mut String, width: f32, editor_font_size: f32) -> TextEdit<'_> {
+fn editor_widget(
+    text: &mut String,
+    width: f32,
+    min_height: f32,
+    editor_font_size: f32,
+) -> TextEdit<'_> {
     TextEdit::multiline(text)
         .font(editor_font_id(editor_font_size))
         .text_color(VSCODE_TEXT)
         .desired_width(width)
         .desired_rows(32)
+        .min_size(Vec2::new(
+            width,
+            min_height.max(editor_row_height(editor_font_size)),
+        ))
         .lock_focus(true)
+        .margin(Margin::ZERO)
         .frame(false)
 }
 
@@ -2527,12 +3653,190 @@ mod tests {
     }
 
     #[test]
+    fn add_next_occurrence_command_tracks_multiple_selections() {
+        let mut app = PhantomApp {
+            document: ActiveDocument::Inline(EditorDocument::from_saved_text(
+                PathBuf::from("sample.txt"),
+                "cat dog cat".to_owned(),
+            )),
+            current_inline_selection: Some(TextSelection::new(0, 3)),
+            ..Default::default()
+        };
+
+        app.add_next_occurrence_selection();
+
+        assert_eq!(
+            app.inline_selections,
+            vec![TextSelection::new(0, 3), TextSelection::new(8, 11)]
+        );
+    }
+
+    #[test]
+    fn case_conversion_command_updates_inline_document() {
+        let mut app = PhantomApp {
+            document: ActiveDocument::Inline(EditorDocument::from_saved_text(
+                PathBuf::from("sample.txt"),
+                "alpha beta".to_owned(),
+            )),
+            current_inline_selection: Some(TextSelection::new(6, 10)),
+            ..Default::default()
+        };
+
+        app.convert_selected_case(CaseTransform::Upper);
+
+        let ActiveDocument::Inline(document) = app.document else {
+            panic!("test document should be inline");
+        };
+        assert_eq!(document.text(), "alpha BETA");
+    }
+
+    #[test]
+    fn highlight_layout_marks_search_and_selection_backgrounds() {
+        let layout_job = editor_highlight_layout_job(
+            "let alpha = \"alpha\";",
+            320.0,
+            DEFAULT_EDITOR_FONT_SIZE,
+            "alpha",
+            SearchOptions::default(),
+            Some(TextSelection::new(0, 3)),
+            &[TextSelection::new(0, 3)],
+        );
+
+        assert_eq!(layout_job.text, "let alpha = \"alpha\";");
+        assert!(layout_job
+            .sections
+            .iter()
+            .any(|section| section.format.background == VSCODE_HIGHLIGHT));
+        assert!(layout_job
+            .sections
+            .iter()
+            .any(|section| section.format.background == VSCODE_SELECTION_HIGHLIGHT));
+        assert!(layout_job
+            .sections
+            .iter()
+            .any(|section| section.format.color == SYNTAX_KEYWORD));
+        assert!(layout_job
+            .sections
+            .iter()
+            .any(|section| section.format.color == SYNTAX_STRING));
+    }
+
+    #[test]
+    fn matching_bracket_pair_finds_nested_pair() {
+        assert_eq!(matching_bracket_pair("a({b})", 2), Some((2, 4)));
+        assert_eq!(matching_bracket_pair("a({b})", 6), Some((1, 5)));
+    }
+
+    #[test]
     fn editor_zoom_scales_row_height_and_width_estimates() {
         assert!(editor_row_height(DEFAULT_EDITOR_FONT_SIZE * 2.0) > EDITOR_ROW_HEIGHT);
         assert!(
             editor_text_width_for_characters(80, DEFAULT_EDITOR_FONT_SIZE * 2.0)
                 > editor_text_width_for_characters(80, DEFAULT_EDITOR_FONT_SIZE)
         );
+    }
+
+    #[test]
+    fn inline_editor_min_height_covers_viewport_and_document_lines() {
+        assert_eq!(
+            inline_editor_min_height(480.0, 2, DEFAULT_EDITOR_FONT_SIZE),
+            480.0
+        );
+        assert_eq!(
+            inline_editor_min_height(40.0, 10, DEFAULT_EDITOR_FONT_SIZE),
+            EDITOR_ROW_HEIGHT * 10.0
+        );
+    }
+
+    #[test]
+    fn inline_editor_widget_reserves_minimum_drag_selection_height() {
+        egui::__run_test_ui(|ui| {
+            let mut text = "alpha\nbeta".to_owned();
+            let output = editor_widget(&mut text, 320.0, 360.0, DEFAULT_EDITOR_FONT_SIZE).show(ui);
+
+            assert!(
+                output.response.rect.height() >= 360.0,
+                "inline editor height {} should cover the requested selection area",
+                output.response.rect.height()
+            );
+        });
+    }
+
+    #[test]
+    fn large_line_block_edit_updates_multiple_visible_lines() -> std::io::Result<()> {
+        let path = unique_main_temp_path("large_line_block_edit.txt");
+        std::fs::write(&path, "alpha\nbeta\ngamma")?;
+        let mut document = phantom::open_large_document_with_viewport(&path, 64)?;
+
+        let message = apply_large_line_block_edit(&mut document, 0..2, "ALPHA\nBETA");
+
+        assert!(matches!(message, Some(AppMessage::Info(_))));
+        assert_eq!(document.file_line_text(0), Some("ALPHA"));
+        assert_eq!(document.file_line_text(1), Some("BETA"));
+        assert_eq!(document.file_line_text(2), Some("gamma"));
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn large_line_block_edit_rejects_line_count_changes() -> std::io::Result<()> {
+        let path = unique_main_temp_path("large_line_block_edit_line_count.txt");
+        std::fs::write(&path, "alpha\nbeta\ngamma")?;
+        let mut document = phantom::open_large_document_with_viewport(&path, 64)?;
+
+        let message = apply_large_line_block_edit(&mut document, 0..2, "ALPHA\nBETA\nEXTRA");
+
+        assert!(matches!(message, Some(AppMessage::Error(_))));
+        assert_eq!(document.file_line_text(0), Some("alpha"));
+        assert_eq!(document.file_line_text(1), Some("beta"));
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn large_line_block_layout_uses_full_text_width_to_prevent_wrapping() {
+        assert_eq!(large_line_block_layout_width(320.0, 2_400.0), 2_400.0);
+        assert_eq!(large_line_block_layout_width(640.0, 320.0), 640.0);
+    }
+
+    #[test]
+    fn large_non_wrapped_rows_remove_implicit_spacing() {
+        egui::__run_test_ui(|ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+
+            configure_large_non_wrapped_row_spacing(ui);
+
+            assert_eq!(ui.spacing().item_spacing.y, 0.0);
+        });
+    }
+
+    #[test]
+    fn highlighted_layout_uses_virtual_editor_row_height() {
+        let layout_job = editor_highlight_layout_job(
+            "alpha\nbeta",
+            320.0,
+            DEFAULT_EDITOR_FONT_SIZE,
+            "",
+            SearchOptions::default(),
+            None,
+            &[],
+        );
+
+        assert!(layout_job
+            .sections
+            .iter()
+            .all(|section| section.format.line_height == Some(EDITOR_ROW_HEIGHT)));
+    }
+
+    fn unique_main_temp_path(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+
+        std::env::temp_dir().join(format!("phantom-main-{unique}-{name}"))
     }
 
     #[test]

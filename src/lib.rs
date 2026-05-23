@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod editor_ops;
 pub mod search;
 
 #[cfg(unix)]
