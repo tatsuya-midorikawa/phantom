@@ -18,6 +18,8 @@ windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
 codegen-units = 1
+panic = "abort"
 strip = "symbols"
+debug = false

@@ -1,12 +1,15 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use eframe::egui::{
     self,
+    scroll_area::ScrollBarVisibility,
     text::{CCursor, CCursorRange, LayoutJob},
     widgets::text_edit::TextEditState,
     Align, Align2, Color32, CornerRadius, FontFamily, FontId, Frame, KeyboardShortcut, Layout,
@@ -15,7 +18,7 @@ use eframe::egui::{
 use phantom::{
     editor_ops::{self, CaseTransform, TextSelection},
     open_text_document, save_document, save_large_document,
-    search::{find_text_matches, line_preview, replace_all as search_replace_all, SearchOptions},
+    search::{line_preview, CompiledSearch, SearchOptions},
     EditorDocument, LargeDocument, OpenedDocument,
 };
 use rfd::FileDialog;
@@ -51,8 +54,12 @@ const MIN_EDITOR_FONT_SIZE: f32 = 10.0;
 const MAX_EDITOR_FONT_SIZE: f32 = 32.0;
 const INLINE_EDITOR_ID_SOURCE: &str = "inline_editor";
 const WRAP_MEASURE_OVERSCAN_LINES: usize = 64;
-const SEARCH_RESULT_LIMIT: usize = 200;
+const SEARCH_RESULT_LIMIT: usize = usize::MAX;
 const HIGHLIGHT_SEARCH_LIMIT: usize = 1_000;
+const MAX_RICH_HIGHLIGHT_BYTES: usize = 256 * 1024;
+const AUTO_WORD_HIGHLIGHT_MAX_BYTES: usize = 200;
+const LARGE_LINE_GALLEY_CACHE_CAPACITY: usize = 4_096;
+const SEARCH_RESULT_MIN_VISIBLE_ROWS: usize = 8;
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
@@ -184,15 +191,8 @@ enum ViewportMove {
     Line(usize),
 }
 
-#[derive(Debug)]
-enum ViewportTaskResult {
-    Loaded(Box<LargeDocument>),
-    Failed(String),
-}
-
 enum LargeEditorAction {
     Message(AppMessage),
-    LoadLine(usize),
 }
 
 #[derive(Debug, Default)]
@@ -228,6 +228,9 @@ struct SearchPanelState {
     match_case: bool,
     whole_word: bool,
     use_regex: bool,
+    executed_query: String,
+    executed_options: SearchOptions,
+    compiled_search: Option<CompiledSearch>,
     results: Vec<SearchResultRow>,
     error: Option<String>,
     searched_scope: Option<&'static str>,
@@ -241,12 +244,51 @@ impl SearchPanelState {
             use_regex: self.use_regex,
         }
     }
+
+    fn executed_options(&self) -> SearchOptions {
+        self.executed_options
+    }
+
+    fn highlight_query(&self) -> &str {
+        &self.executed_query
+    }
+
+    fn highlight_pattern(&self) -> Option<&CompiledSearch> {
+        self.compiled_search.as_ref()
+    }
+
+    fn clear_executed_search(&mut self) {
+        self.executed_query.clear();
+        self.executed_options = SearchOptions::default();
+        self.compiled_search = None;
+        self.results.clear();
+        self.error = None;
+        self.searched_scope = None;
+    }
+
+    fn record_successful_search(
+        &mut self,
+        query: String,
+        options: SearchOptions,
+        compiled_search: CompiledSearch,
+        results: Vec<SearchResultRow>,
+        scope: &'static str,
+    ) {
+        self.executed_query = query;
+        self.executed_options = options;
+        self.compiled_search = Some(compiled_search);
+        self.results = results;
+        self.error = None;
+        self.searched_scope = Some(scope);
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct SearchResultRow {
     line_number: usize,
-    preview: String,
+    line_index: usize,
+    preview_byte_index: usize,
+    preview_byte_offset_in_line: usize,
 }
 
 #[derive(Debug, Default)]
@@ -294,6 +336,143 @@ enum InlineInputEdit {
     Delete,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LargePos {
+    line: usize,
+    char: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LargeSelection {
+    anchor: LargePos,
+    head: LargePos,
+}
+
+impl LargeSelection {
+    fn cursor(pos: LargePos) -> Self {
+        Self {
+            anchor: pos,
+            head: pos,
+        }
+    }
+
+    fn is_cursor(self) -> bool {
+        self.anchor == self.head
+    }
+
+    fn ordered(self) -> (LargePos, LargePos) {
+        if (self.anchor.line, self.anchor.char) <= (self.head.line, self.head.char) {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    fn range_on_line(self, line: usize, line_char_count: usize) -> Option<(usize, usize)> {
+        if self.is_cursor() {
+            return None;
+        }
+
+        let (start, end) = self.ordered();
+
+        if line < start.line || line > end.line {
+            return None;
+        }
+
+        let start_char = if line == start.line { start.char } else { 0 };
+        let end_char = if line == end.line {
+            end.char
+        } else {
+            line_char_count
+        };
+
+        Some((
+            start_char.min(line_char_count),
+            end_char.min(line_char_count),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+struct LargeLineGalleyCacheKey {
+    line_index: usize,
+    text_len: usize,
+    text_hash: u64,
+    text_width_bits: u32,
+    editor_font_size_bits: u32,
+    wrap_lines: bool,
+    search_query_hash: u64,
+    search_match_case: bool,
+    search_whole_word: bool,
+    search_use_regex: bool,
+}
+
+#[derive(Debug, Default)]
+struct LargeLineGalleyCache {
+    entries: HashMap<LargeLineGalleyCacheKey, Arc<egui::Galley>>,
+    insertion_order: VecDeque<LargeLineGalleyCacheKey>,
+}
+
+impl LargeLineGalleyCache {
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.insertion_order.clear();
+    }
+
+    fn get_or_insert_with(
+        &mut self,
+        key: LargeLineGalleyCacheKey,
+        build: impl FnOnce() -> Arc<egui::Galley>,
+    ) -> Arc<egui::Galley> {
+        if let Some(galley) = self.entries.get(&key) {
+            return galley.clone();
+        }
+
+        let galley = build();
+        self.entries.insert(key.clone(), galley.clone());
+        self.insertion_order.push_back(key);
+
+        while self.entries.len() > LARGE_LINE_GALLEY_CACHE_CAPACITY {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+
+        galley
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+fn hash_text(value: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn large_line_galley_cache_key(
+    line_index: usize,
+    line_text: &str,
+    view: LargeLineRenderView<'_>,
+) -> LargeLineGalleyCacheKey {
+    LargeLineGalleyCacheKey {
+        line_index,
+        text_len: line_text.len(),
+        text_hash: hash_text(line_text),
+        text_width_bits: view.text_width.to_bits(),
+        editor_font_size_bits: view.editor_font_size.to_bits(),
+        wrap_lines: view.wrap_lines,
+        search_query_hash: hash_text(view.search_query),
+        search_match_case: view.search_options.match_case,
+        search_whole_word: view.search_options.whole_word,
+        search_use_regex: view.search_options.use_regex,
+    }
+}
+
 struct PhantomApp {
     document: ActiveDocument,
     path_input: String,
@@ -310,9 +489,19 @@ struct PhantomApp {
     inline_selections: Vec<TextSelection>,
     pending_inline_selection: Option<TextSelection>,
     rectangular_clipboard: Option<String>,
+    large_editing_line: Option<usize>,
+    large_selection: Option<LargeSelection>,
+    large_dragging: bool,
+    large_line_galley_cache: LargeLineGalleyCache,
+    editor_content_height: f32,
+    /// Monotonically non-decreasing cache of the longest line character count
+    /// seen across all viewport reloads of the current file. Used to keep the
+    /// large-editor ScrollArea content_width stable so its scroll position is
+    /// not silently desynced when a viewport swap shrinks the longest visible
+    /// line.
+    large_longest_columns_cache: usize,
     open_receiver: Option<Receiver<OpenTaskResult>>,
     save_receiver: Option<Receiver<SaveTaskResult>>,
-    viewport_receiver: Option<Receiver<ViewportTaskResult>>,
 }
 
 impl Default for PhantomApp {
@@ -333,9 +522,14 @@ impl Default for PhantomApp {
             inline_selections: Vec::new(),
             pending_inline_selection: None,
             rectangular_clipboard: None,
+            large_editing_line: None,
+            large_selection: None,
+            large_dragging: false,
+            large_line_galley_cache: LargeLineGalleyCache::default(),
+            editor_content_height: 0.0,
+            large_longest_columns_cache: 0,
             open_receiver: None,
             save_receiver: None,
-            viewport_receiver: None,
         }
     }
 }
@@ -344,7 +538,6 @@ impl eframe::App for PhantomApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_background_open(context);
         self.poll_background_save(context);
-        self.poll_background_viewport(context);
         self.guard_close_request(context);
         self.handle_dropped_files(context);
         self.handle_keyboard_shortcuts(context);
@@ -363,6 +556,7 @@ impl eframe::App for PhantomApp {
         self.show_editor(context);
         self.show_go_to_line_window(context);
         self.show_help_window(context);
+        self.handle_large_selection_shortcuts(context);
     }
 }
 
@@ -403,24 +597,6 @@ impl PhantomApp {
         }
     }
 
-    fn poll_background_viewport(&mut self, context: &egui::Context) {
-        let Some(receiver) = self.viewport_receiver.as_ref() else {
-            return;
-        };
-
-        match receiver.try_recv() {
-            Ok(result) => {
-                self.viewport_receiver = None;
-                self.apply_viewport_result(result);
-            }
-            Err(TryRecvError::Empty) => context.request_repaint_after(Duration::from_millis(50)),
-            Err(TryRecvError::Disconnected) => {
-                self.viewport_receiver = None;
-                self.message = AppMessage::Error("Viewport task failed".to_owned());
-            }
-        }
-    }
-
     fn apply_open_result(&mut self, result: OpenTaskResult) {
         match result {
             OpenTaskResult::Opened(OpenedDocument::Inline(document)) => {
@@ -430,6 +606,12 @@ impl PhantomApp {
                     .unwrap_or_default();
                 self.wrap_line_heights.clear();
                 self.clear_inline_edit_state();
+                self.large_editing_line = None;
+                self.large_selection = None;
+                self.large_dragging = false;
+                self.large_line_galley_cache.clear();
+                self.large_longest_columns_cache = 0;
+                self.search.clear_executed_search();
                 self.document = ActiveDocument::Inline(document);
                 self.message = AppMessage::Info("Opened".to_owned());
             }
@@ -443,6 +625,12 @@ impl PhantomApp {
                 ));
                 self.wrap_line_heights.clear();
                 self.clear_inline_edit_state();
+                self.large_editing_line = None;
+                self.large_selection = None;
+                self.large_dragging = false;
+                self.large_line_galley_cache.clear();
+                self.large_longest_columns_cache = 0;
+                self.search.clear_executed_search();
                 self.document = ActiveDocument::Large(document);
             }
             OpenTaskResult::Failed { path, error } => {
@@ -462,22 +650,6 @@ impl PhantomApp {
             SaveTaskResult::Failed { path, error } => {
                 self.path_input = path.display().to_string();
                 self.message = AppMessage::Error(format!("Save failed: {error}"));
-            }
-        }
-    }
-
-    fn apply_viewport_result(&mut self, result: ViewportTaskResult) {
-        match result {
-            ViewportTaskResult::Loaded(document) => {
-                self.message = AppMessage::Info(format!(
-                    "Loaded window {}..{}",
-                    document.viewport().start_byte(),
-                    document.viewport().end_byte()
-                ));
-                self.document = ActiveDocument::Large(document);
-            }
-            ViewportTaskResult::Failed(error) => {
-                self.message = AppMessage::Error(format!("Move failed: {error}"));
             }
         }
     }
@@ -898,7 +1070,54 @@ impl PhantomApp {
         let selection = self.current_inline_selection;
         self.inline_selections.clear();
         self.pending_inline_selection = selection;
+        self.large_selection = None;
+        self.large_dragging = false;
         self.message = AppMessage::Info("Cleared multi-cursor selections".to_owned());
+    }
+
+    fn copy_large_selection(&mut self, context: &egui::Context) {
+        let ActiveDocument::Large(document) = &self.document else {
+            return;
+        };
+        let Some(selection) = self.large_selection else {
+            return;
+        };
+
+        if selection.is_cursor() {
+            return;
+        }
+
+        let Some(text) = collect_large_selection_text(document, selection) else {
+            self.message = AppMessage::Error(
+                "Selection extends beyond the loaded viewport; load it and try again".to_owned(),
+            );
+            return;
+        };
+
+        let char_count = text.chars().count();
+
+        context.copy_text(text);
+        self.message = AppMessage::Info(format!("Copied {char_count} character(s)"));
+    }
+
+    fn handle_large_selection_shortcuts(&mut self, context: &egui::Context) {
+        if !matches!(self.document, ActiveDocument::Large(_)) {
+            return;
+        }
+
+        if self.large_editing_line.is_some() {
+            return;
+        }
+
+        if !is_copyable_large_selection(self.large_selection) {
+            return;
+        }
+
+        let copy_pressed = context.input_mut(consume_copy_request);
+
+        if copy_pressed {
+            self.copy_large_selection(context);
+        }
     }
 
     fn show_menu_bar(&mut self, context: &egui::Context) {
@@ -1191,15 +1410,23 @@ impl PhantomApp {
 
     fn show_search(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
+        // The sidebar is rendered before the editor panel, so this uses the
+        // editor height observed on the previous frame. That is enough to keep
+        // the search result list aligned during normal use while still falling
+        // back to the current sidebar height on the first frame.
+        let content_height =
+            search_panel_content_height(ui.available_height(), self.editor_content_height);
         ui.horizontal(|ui| {
             ui.add_space(12.0);
             ui.vertical(|ui| {
+                ui.set_height(content_height);
                 let query_response = ui.add(
                     TextEdit::singleline(&mut self.search.query)
                         .hint_text("Search")
                         .desired_width(ui.available_width()),
                 );
                 let enter_pressed = ui.input(|input| input.key_pressed(egui::Key::Enter));
+                let query_changed = query_response.changed();
 
                 ui.add_space(4.0);
                 ui.add(
@@ -1209,16 +1436,28 @@ impl PhantomApp {
                 );
 
                 ui.add_space(6.0);
+                let mut options_changed = false;
                 ui.horizontal_wrapped(|ui| {
-                    ui.checkbox(&mut self.search.match_case, "Match Case");
-                    ui.checkbox(&mut self.search.whole_word, "Whole Word");
-                    ui.checkbox(&mut self.search.use_regex, "Regex");
+                    options_changed |= ui
+                        .checkbox(&mut self.search.match_case, "Match Case")
+                        .changed();
+                    options_changed |= ui
+                        .checkbox(&mut self.search.whole_word, "Whole Word")
+                        .changed();
+                    options_changed |= ui.checkbox(&mut self.search.use_regex, "Regex").changed();
                 });
+
+                if query_changed || options_changed {
+                    self.search.clear_executed_search();
+                }
 
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Find").clicked() || (query_response.lost_focus() && enter_pressed)
-                    {
+                    if should_submit_search(
+                        ui.button("Find").clicked(),
+                        query_response.has_focus(),
+                        enter_pressed,
+                    ) {
                         self.run_search();
                     }
 
@@ -1259,21 +1498,52 @@ impl PhantomApp {
         );
         ui.add_space(6.0);
 
+        let row_height = editor_row_height(self.editor_font_size);
+        let result_list_height =
+            search_result_list_height(ui.available_height(), self.search.results.len(), row_height);
+        let scroll_bar_visibility = search_result_scroll_bar_visibility(
+            self.search.results.len(),
+            result_list_height,
+            row_height,
+        );
+
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for result in &self.search.results {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!("{}", result.line_number))
-                                .color(VSCODE_TEXT_DIM)
-                                .monospace(),
-                        );
-                        ui.label(RichText::new(&result.preview).color(VSCODE_TEXT));
-                    });
-                    ui.add_space(3.0);
-                }
-            });
+            .scroll_bar_visibility(scroll_bar_visibility)
+            .max_height(result_list_height)
+            .show_rows(
+                ui,
+                row_height,
+                self.search.results.len(),
+                |ui, row_range| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+
+                    for row_index in row_range {
+                        if let Some(result) = self.search.results.get(row_index) {
+                            let preview = self.search_result_preview(result);
+                            Self::show_search_result_row(
+                                ui,
+                                result,
+                                &preview,
+                                row_height,
+                                self.editor_font_size,
+                            );
+                        }
+                    }
+                },
+            );
+    }
+
+    fn search_result_preview(&self, result: &SearchResultRow) -> String {
+        match &self.document {
+            ActiveDocument::Inline(document) => {
+                line_preview(document.text(), result.preview_byte_index)
+            }
+            ActiveDocument::Large(document) => document
+                .display_line_text(result.line_index)
+                .map(|line_text| line_preview(line_text, result.preview_byte_offset_in_line))
+                .unwrap_or_else(|| "(result source unavailable)".to_owned()),
+        }
     }
 
     fn run_search(&mut self) {
@@ -1281,41 +1551,87 @@ impl PhantomApp {
         let options = self.search.options();
         let (scope, base_line, text) = match &self.document {
             ActiveDocument::Inline(document) => ("document", 0, document.text()),
-            ActiveDocument::Large(document) => (
+            ActiveDocument::Large(document) if document.is_dirty() => (
                 "current viewport",
                 document.viewport_start_line(),
                 document.viewport_text(),
             ),
+            ActiveDocument::Large(document) => match document.full_text_from_mmap() {
+                Ok(text) => ("file", 0, text),
+                Err(error) => {
+                    self.search.results.clear();
+                    self.search.executed_query.clear();
+                    self.search.executed_options = SearchOptions::default();
+                    self.search.compiled_search = None;
+                    self.search.error = Some(error.to_string());
+                    self.search.searched_scope = Some("file");
+                    self.message = AppMessage::Error(format!("Search failed: {error}"));
+                    return;
+                }
+            },
         };
 
-        match find_text_matches(text, &query, options, SEARCH_RESULT_LIMIT) {
-            Ok(matches) => {
-                self.search.results = matches
-                    .into_iter()
-                    .map(|search_match| SearchResultRow {
-                        line_number: base_line + search_match.line_index + 1,
-                        preview: line_preview(text, search_match.range.start),
-                    })
-                    .collect();
-                self.search.error = None;
-                self.search.searched_scope = Some(scope);
-                self.message = AppMessage::Info(format!(
-                    "Found {} result{}",
-                    self.search.results.len(),
-                    if self.search.results.len() == 1 {
-                        ""
-                    } else {
-                        "s"
-                    }
-                ));
-            }
+        let compiled_search = match CompiledSearch::new(&query, options) {
+            Ok(compiled_search) => compiled_search,
             Err(error) => {
                 self.search.results.clear();
+                self.search.executed_query.clear();
+                self.search.executed_options = SearchOptions::default();
+                self.search.compiled_search = None;
                 self.search.error = Some(error.to_string());
                 self.search.searched_scope = Some(scope);
                 self.message = AppMessage::Error(format!("Search failed: {error}"));
+                return;
             }
-        }
+        };
+
+        let results: Vec<SearchResultRow> = compiled_search
+            .find_matches(text, SEARCH_RESULT_LIMIT)
+            .into_iter()
+            .map(|search_match| SearchResultRow {
+                line_number: base_line + search_match.line_index + 1,
+                line_index: base_line + search_match.line_index,
+                preview_byte_index: search_match.range.start,
+                preview_byte_offset_in_line: search_match.range.start - search_match.line_start,
+            })
+            .collect();
+        let result_count = results.len();
+        self.search
+            .record_successful_search(query, options, compiled_search, results, scope);
+        self.search.error = None;
+        self.message = AppMessage::Info(format!(
+            "Found {} result{}",
+            result_count,
+            if result_count == 1 { "" } else { "s" }
+        ));
+    }
+
+    fn show_search_result_row(
+        ui: &mut egui::Ui,
+        result: &SearchResultRow,
+        preview: &str,
+        row_height: f32,
+        editor_font_size: f32,
+    ) {
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), row_height), Sense::hover());
+        let line_number_width = 52.0;
+        let y = rect.top();
+
+        ui.painter().text(
+            egui::pos2(rect.left(), y),
+            Align2::LEFT_TOP,
+            result.line_number.to_string(),
+            editor_font_id(editor_font_size),
+            VSCODE_TEXT_DIM,
+        );
+        ui.painter().text(
+            egui::pos2(rect.left() + line_number_width, y),
+            Align2::LEFT_TOP,
+            preview,
+            editor_font_id(editor_font_size),
+            VSCODE_TEXT,
+        );
     }
 
     fn replace_all_inline_matches(&mut self) {
@@ -1328,8 +1644,9 @@ impl PhantomApp {
         let replacement = self.search.replacement.clone();
         let options = self.search.options();
 
-        match search_replace_all(document.text(), &query, &replacement, options) {
-            Ok((text, count)) => {
+        match CompiledSearch::new(&query, options) {
+            Ok(compiled_search) => {
+                let (text, count) = compiled_search.replace_all(document.text(), &replacement);
                 if count > 0 {
                     document.replace_text(text);
                 }
@@ -1430,31 +1747,27 @@ impl PhantomApp {
         egui::CentralPanel::default()
             .frame(frame)
             .show(context, |ui| {
-                if self.open_receiver.is_some()
-                    || self.save_receiver.is_some()
-                    || self.viewport_receiver.is_some()
-                {
-                    let label = if self.open_receiver.is_some() {
-                        "Opening file..."
-                    } else if self.save_receiver.is_some() {
-                        "Saving file..."
-                    } else {
-                        "Loading window..."
-                    };
+                self.editor_content_height = ui.available_height();
 
+                if self.open_receiver.is_some() {
                     ui.centered_and_justified(|ui| {
-                        ui.label(RichText::new(label).color(VSCODE_TEXT_DIM));
+                        ui.label(RichText::new("Opening file...").color(VSCODE_TEXT_DIM));
                     });
                     return;
                 }
 
                 let editor_font_size = self.editor_font_size;
-                let search_query = self.search.query.clone();
-                let search_options = self.search.options();
+                let highlight_query = self.search.highlight_query().to_owned();
+                let highlight_options = self.search.executed_options();
+                let highlight_pattern = self.search.highlight_pattern().cloned();
                 let current_inline_selection_snapshot = self.current_inline_selection;
                 let inline_selections_snapshot = self.inline_selections.clone();
                 let pending_inline_selection = &mut self.pending_inline_selection;
                 let current_inline_selection = &mut self.current_inline_selection;
+                let large_editing_line = &mut self.large_editing_line;
+                let large_selection = &mut self.large_selection;
+                let large_dragging = &mut self.large_dragging;
+                let large_line_galley_cache = &mut self.large_line_galley_cache;
                 let large_editor_action = match &mut self.document {
                     ActiveDocument::Inline(document) => {
                         let wrap_lines = self.wrap_lines;
@@ -1490,8 +1803,7 @@ impl PhantomApp {
                                         text,
                                         wrap_width,
                                         editor_font_size,
-                                        &search_query,
-                                        search_options,
+                                        highlight_pattern.as_ref(),
                                         current_inline_selection_snapshot,
                                         &inline_selections_snapshot,
                                     ))
@@ -1529,11 +1841,21 @@ impl PhantomApp {
                     ActiveDocument::Large(document) => show_large_virtual_editor(
                         ui,
                         document,
-                        self.wrap_lines,
-                        editor_font_size,
-                        &self.search.query,
-                        self.search.options(),
-                        &mut self.wrap_line_heights,
+                        LargeEditorRenderOptions {
+                            wrap_lines: self.wrap_lines,
+                            editor_font_size,
+                            search_query: &highlight_query,
+                            search_options: highlight_options,
+                            search_pattern: highlight_pattern.as_ref(),
+                        },
+                        LargeEditorState {
+                            wrap_line_heights: &mut self.wrap_line_heights,
+                            editing_line: large_editing_line,
+                            selection: large_selection,
+                            dragging: large_dragging,
+                            line_galley_cache: large_line_galley_cache,
+                            longest_columns_cache: &mut self.large_longest_columns_cache,
+                        },
                     ),
                 };
 
@@ -1635,6 +1957,8 @@ impl PhantomApp {
                 help_row(ui, "Rectangle", "Alt+Shift+R/C/V");
                 help_row(ui, "Wrap Lines", "Alt+Z");
                 help_row(ui, "Zoom", "Cmd/Ctrl+Plus, Minus, 0");
+                help_row(ui, "Large File Edit", "Double-click a line");
+                help_row(ui, "Copy Large Selection", "Cmd/Ctrl+C");
                 help_row(ui, "Help", "F1");
             });
 
@@ -1706,9 +2030,14 @@ impl PhantomApp {
 
         self.open_receiver = None;
         self.save_receiver = None;
-        self.viewport_receiver = None;
         self.wrap_line_heights.clear();
         self.clear_inline_edit_state();
+        self.large_editing_line = None;
+        self.large_selection = None;
+        self.large_dragging = false;
+        self.large_line_galley_cache.clear();
+        self.large_longest_columns_cache = 0;
+        self.search.clear_executed_search();
         self.document = ActiveDocument::default();
         self.path_input.clear();
         self.message = AppMessage::Info("New document".to_owned());
@@ -1810,10 +2139,6 @@ impl PhantomApp {
         } else if self.save_receiver.is_some() {
             self.message = AppMessage::Error("Wait for the current save task to finish".to_owned());
             false
-        } else if self.viewport_receiver.is_some() {
-            self.message =
-                AppMessage::Error("Wait for the current viewport task to finish".to_owned());
-            false
         } else {
             true
         }
@@ -1837,13 +2162,6 @@ impl PhantomApp {
                 self.wrap_line_heights.invalidate_measurements();
                 self.message = message;
             }
-            LargeEditorAction::LoadLine(line_index) => {
-                if self.wrap_lines {
-                    self.wrap_line_heights.scroll_anchor_line = Some(line_index);
-                }
-
-                self.move_large_viewport_to_line(line_index);
-            }
         }
     }
 
@@ -1852,34 +2170,39 @@ impl PhantomApp {
             return;
         }
 
-        let ActiveDocument::Large(document) = &self.document else {
+        let ActiveDocument::Large(document) = &mut self.document else {
             return;
         };
 
-        let (sender, receiver) = mpsc::channel();
-        let mut task_document = document.clone();
         let direction_label = match viewport_move {
             ViewportMove::Previous => "previous",
             ViewportMove::Next => "next",
             ViewportMove::Line(_) => "selected",
         };
 
-        self.viewport_receiver = Some(receiver);
-        self.message = AppMessage::Info(format!("Loading {direction_label} window"));
+        // Viewport reloads are served from the persistent memory-mapped file
+        // on the main thread. There is no benefit to threading: the work is a
+        // <=1 MiB memcpy plus a UTF-8 check, well below a single frame budget.
+        let result = match viewport_move {
+            ViewportMove::Previous => document.load_previous_viewport(),
+            ViewportMove::Next => document.load_next_viewport(),
+            ViewportMove::Line(line_index) => document.load_viewport_for_line(line_index),
+        };
 
-        thread::spawn(move || {
-            let result = match viewport_move {
-                ViewportMove::Previous => task_document.load_previous_viewport(),
-                ViewportMove::Next => task_document.load_next_viewport(),
-                ViewportMove::Line(line_index) => task_document.load_viewport_for_line(line_index),
-            };
-            let message = match result {
-                Ok(()) => ViewportTaskResult::Loaded(task_document),
-                Err(error) => ViewportTaskResult::Failed(error.to_string()),
-            };
-
-            let _ = sender.send(message);
-        });
+        match result {
+            Ok(()) => {
+                self.message = AppMessage::Info(format!(
+                    "Loaded {direction_label} window {}..{}",
+                    document.viewport().start_byte(),
+                    document.viewport().end_byte()
+                ));
+                self.large_editing_line = None;
+                self.large_dragging = false;
+            }
+            Err(error) => {
+                self.message = AppMessage::Error(format!("Move failed: {error}"));
+            }
+        }
     }
 
     fn can_start_viewport_move(&mut self) -> bool {
@@ -1888,10 +2211,6 @@ impl PhantomApp {
             false
         } else if self.save_receiver.is_some() {
             self.message = AppMessage::Error("Wait for the current save task to finish".to_owned());
-            false
-        } else if self.viewport_receiver.is_some() {
-            self.message =
-                AppMessage::Error("Wait for the current viewport task to finish".to_owned());
             false
         } else if self.document.is_dirty() {
             self.message = AppMessage::Error("Save the current viewport before moving".to_owned());
@@ -1965,12 +2284,6 @@ impl PhantomApp {
             return false;
         }
 
-        if self.viewport_receiver.is_some() {
-            self.message =
-                AppMessage::Error("Wait for the current viewport task to finish".to_owned());
-            return false;
-        }
-
         if self.document.is_dirty() {
             self.message = AppMessage::Error(format!("Save the current document before {action}"));
             false
@@ -1980,10 +2293,7 @@ impl PhantomApp {
     }
 
     fn should_block_close(&self) -> bool {
-        self.document.is_dirty()
-            || self.open_receiver.is_some()
-            || self.save_receiver.is_some()
-            || self.viewport_receiver.is_some()
+        self.document.is_dirty() || self.open_receiver.is_some() || self.save_receiver.is_some()
     }
 
     fn guard_close_request(&mut self, context: &egui::Context) {
@@ -1994,14 +2304,29 @@ impl PhantomApp {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LargeEditorRenderOptions<'a> {
+    wrap_lines: bool,
+    editor_font_size: f32,
+    search_query: &'a str,
+    search_options: SearchOptions,
+    search_pattern: Option<&'a CompiledSearch>,
+}
+
+struct LargeEditorState<'a> {
+    wrap_line_heights: &'a mut WrapLineHeightCache,
+    editing_line: &'a mut Option<usize>,
+    selection: &'a mut Option<LargeSelection>,
+    dragging: &'a mut bool,
+    line_galley_cache: &'a mut LargeLineGalleyCache,
+    longest_columns_cache: &'a mut usize,
+}
+
 fn show_large_virtual_editor(
     ui: &mut egui::Ui,
     document: &mut LargeDocument,
-    wrap_lines: bool,
-    editor_font_size: f32,
-    search_query: &str,
-    search_options: SearchOptions,
-    wrap_line_heights: &mut WrapLineHeightCache,
+    options: LargeEditorRenderOptions<'_>,
+    state: LargeEditorState<'_>,
 ) -> Option<LargeEditorAction> {
     ui.horizontal(|ui| {
         ui.add_space(12.0);
@@ -2029,20 +2354,29 @@ fn show_large_virtual_editor(
     ui.add_space(4.0);
 
     let available_width = ui.available_width();
-    let content_width = editor_content_width_for_text(
-        document.viewport_text(),
+    let viewport_longest_columns = document.viewport_longest_line_chars();
+    // Keep the cached longest-line column count monotonically non-decreasing so
+    // a viewport swap from long-line to short-line content does not shrink the
+    // ScrollArea content width. A shrinking content width was causing egui to
+    // re-clamp scroll state mid-interaction, which made the visible row range
+    // jump to unrelated lines while the user was trying to select.
+    let stable_longest_columns = viewport_longest_columns.max(*state.longest_columns_cache);
+    *state.longest_columns_cache = stable_longest_columns;
+    let content_width = editor_content_width_for_line_columns(
+        stable_longest_columns,
         available_width,
-        wrap_lines,
-        editor_font_size,
+        options.wrap_lines,
+        options.editor_font_size,
     )
     .max(available_width);
-    let text_width = editor_text_width(content_width, wrap_lines);
+    let text_width = editor_text_width(content_width, options.wrap_lines);
     let line_count = document.file_line_count().max(1);
-    let row_height = editor_row_height(editor_font_size);
+    let row_height = editor_row_height(options.editor_font_size);
     let mut action = None;
 
-    if wrap_lines {
+    if options.wrap_lines {
         egui::ScrollArea::vertical()
+            .id_salt("large_editor_wrap_scroll")
             .auto_shrink([false, false])
             .show_viewport(ui, |ui, viewport| {
                 show_wrapped_large_virtual_rows(
@@ -2054,11 +2388,18 @@ fn show_large_virtual_editor(
                         content_width,
                         text_width,
                         row_height,
-                        editor_font_size,
+                        editor_font_size: options.editor_font_size,
+                        search_query: options.search_query,
+                        search_options: options.search_options,
+                        search_pattern: options.search_pattern,
                     },
                     WrappedRowsState {
-                        cache: wrap_line_heights,
+                        cache: state.wrap_line_heights,
                         action: &mut action,
+                        editing_line: state.editing_line,
+                        selection: state.selection,
+                        dragging: state.dragging,
+                        line_galley_cache: state.line_galley_cache,
                     },
                 );
             });
@@ -2070,59 +2411,31 @@ fn show_large_virtual_editor(
         configure_large_non_wrapped_row_spacing(ui);
 
         egui::ScrollArea::both()
+            .id_salt("large_editor_non_wrap_scroll")
             .auto_shrink([false, false])
             .show_rows(ui, row_height, line_count, |ui, row_range| {
                 ui.set_min_width(content_width);
 
-                if action.is_none() {
-                    if let Some(line_index) =
-                        first_missing_visible_line(row_range.clone(), |line_index| {
-                            document.contains_file_line(line_index)
-                        })
-                    {
-                        action = Some(LargeEditorAction::LoadLine(line_index));
-                    }
-                }
-
-                if !document.contains_file_line(row_range.start) {
-                    for line_index in row_range {
-                        show_loading_line(ui, line_index, row_height, text_width);
-                    }
-
-                    return;
-                }
-
-                if document.contains_file_line_range(row_range.clone()) {
-                    action = show_virtual_line_block(
-                        ui,
-                        document,
-                        row_range,
-                        LargeLineBlockView {
-                            row_height,
-                            text_width,
-                            editor_font_size,
-                            search_query,
-                            search_options,
-                        },
-                    );
-
-                    return;
-                }
-
                 for line_index in row_range {
-                    if !document.contains_file_line(line_index) {
-                        show_loading_line(ui, line_index, row_height, text_width);
-                        continue;
-                    }
-
-                    if let Some(line_message) = show_virtual_line(
+                    if let Some(line_message) = show_fast_virtual_line(
                         ui,
                         document,
                         line_index,
-                        row_height,
-                        text_width,
-                        wrap_lines,
-                        editor_font_size,
+                        LargeLineRenderView {
+                            row_height,
+                            text_width,
+                            editor_font_size: options.editor_font_size,
+                            search_query: options.search_query,
+                            search_options: options.search_options,
+                            search_pattern: options.search_pattern,
+                            wrap_lines: false,
+                        },
+                        LargeLineInteractionState {
+                            editing_line: &mut *state.editing_line,
+                            selection: &mut *state.selection,
+                            dragging: &mut *state.dragging,
+                            galley_cache: &mut *state.line_galley_cache,
+                        },
                     ) {
                         action = Some(LargeEditorAction::Message(line_message));
                     }
@@ -2137,18 +2450,25 @@ fn configure_large_non_wrapped_row_spacing(ui: &mut egui::Ui) {
     ui.spacing_mut().item_spacing.y = 0.0;
 }
 
-struct WrappedRowsGeometry {
+struct WrappedRowsGeometry<'a> {
     viewport: egui::Rect,
     line_count: usize,
     content_width: f32,
     text_width: f32,
     row_height: f32,
     editor_font_size: f32,
+    search_query: &'a str,
+    search_options: SearchOptions,
+    search_pattern: Option<&'a CompiledSearch>,
 }
 
 struct WrappedRowsState<'a> {
     cache: &'a mut WrapLineHeightCache,
     action: &'a mut Option<LargeEditorAction>,
+    editing_line: &'a mut Option<usize>,
+    selection: &'a mut Option<LargeSelection>,
+    dragging: &'a mut bool,
+    line_galley_cache: &'a mut LargeLineGalleyCache,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2161,7 +2481,7 @@ struct WrappedLineMeasurement {
 fn show_wrapped_large_virtual_rows(
     ui: &mut egui::Ui,
     document: &mut LargeDocument,
-    geometry: WrappedRowsGeometry,
+    geometry: WrappedRowsGeometry<'_>,
     state: WrappedRowsState<'_>,
 ) {
     reset_line_height_extras_if_layout_changed(
@@ -2171,6 +2491,16 @@ fn show_wrapped_large_virtual_rows(
         &mut state.cache.line_range,
         geometry.text_width,
         document.viewport_start_line()..document.viewport_end_line(),
+    );
+    let total_height_before_measurement = virtual_editor_total_height(
+        geometry.line_count,
+        geometry.row_height,
+        &state.cache.extras,
+    );
+    let was_at_virtual_bottom = is_virtual_scroll_at_bottom(
+        geometry.viewport,
+        total_height_before_measurement,
+        geometry.row_height,
     );
     let measurement_line_range = wrapped_measurement_line_range(
         geometry.viewport,
@@ -2220,6 +2550,16 @@ fn show_wrapped_large_virtual_rows(
         false
     };
 
+    if !anchored_this_frame
+        && was_at_virtual_bottom
+        && total_height > total_height_before_measurement + f32::EPSILON
+    {
+        ui.scroll_to_rect(
+            virtual_bottom_scroll_rect(ui, geometry.content_width, total_height),
+            Some(Align::Max),
+        );
+    }
+
     let mut line_index = line_index_at_virtual_offset(
         geometry.viewport.min.y,
         geometry.line_count,
@@ -2243,20 +2583,25 @@ fn show_wrapped_large_virtual_rows(
         with_positioned_row_ui(ui, row_rect, |row_ui| {
             row_ui.set_min_width(geometry.content_width);
 
-            if !document.contains_file_line(line_index) {
-                if state.action.is_none() && !anchored_this_frame {
-                    *state.action = Some(LargeEditorAction::LoadLine(line_index));
-                }
-
-                show_loading_line(row_ui, line_index, line_height, geometry.text_width);
-            } else if let Some(line_message) = show_virtual_line(
+            if let Some(line_message) = show_fast_virtual_line(
                 row_ui,
                 document,
                 line_index,
-                line_height,
-                geometry.text_width,
-                true,
-                geometry.editor_font_size,
+                LargeLineRenderView {
+                    row_height: line_height,
+                    text_width: geometry.text_width,
+                    editor_font_size: geometry.editor_font_size,
+                    search_query: geometry.search_query,
+                    search_options: geometry.search_options,
+                    search_pattern: geometry.search_pattern,
+                    wrap_lines: true,
+                },
+                LargeLineInteractionState {
+                    editing_line: &mut *state.editing_line,
+                    selection: &mut *state.selection,
+                    dragging: &mut *state.dragging,
+                    galley_cache: &mut *state.line_galley_cache,
+                },
             ) {
                 *state.action = Some(LargeEditorAction::Message(line_message));
             }
@@ -2290,7 +2635,7 @@ fn measure_wrapped_line_height_extras(
             continue;
         }
 
-        let Some(line_text) = document.file_line_text(line_index) else {
+        let Some(line_text) = document.display_line_text(line_index) else {
             continue;
         };
         let line_height = editor_line_row_height_for_ui(
@@ -2384,6 +2729,20 @@ fn virtual_editor_total_height(
     line_count as f32 * row_height + line_height_extras.values().copied().sum::<f32>()
 }
 
+fn is_virtual_scroll_at_bottom(viewport: egui::Rect, total_height: f32, tolerance: f32) -> bool {
+    viewport.max.y >= total_height - tolerance.max(1.0)
+}
+
+fn virtual_bottom_scroll_rect(ui: &egui::Ui, content_width: f32, total_height: f32) -> egui::Rect {
+    let height = 1.0;
+    let bottom_y = ui.max_rect().top() + total_height.max(height);
+
+    egui::Rect::from_min_size(
+        egui::pos2(ui.max_rect().left(), bottom_y - height),
+        Vec2::new(content_width, height),
+    )
+}
+
 fn virtual_line_top(
     line_index: usize,
     row_height: f32,
@@ -2441,187 +2800,38 @@ fn line_index_at_virtual_offset(
         .min(last_line_index as f32) as usize
 }
 
-fn first_missing_visible_line(
-    row_range: Range<usize>,
-    mut contains_line: impl FnMut(usize) -> bool,
-) -> Option<usize> {
-    row_range
-        .into_iter()
-        .find(|line_index| !contains_line(*line_index))
-}
-
-fn show_loading_line(ui: &mut egui::Ui, line_index: usize, row_height: f32, text_width: f32) {
-    ui.horizontal(|ui| {
-        let (line_number_rect, _) =
-            ui.allocate_exact_size(Vec2::new(EDITOR_GUTTER_WIDTH, row_height), Sense::hover());
-        ui.painter().text(
-            line_number_top_pos(line_number_rect),
-            Align2::RIGHT_TOP,
-            (line_index + 1).to_string(),
-            FontId::new(12.0, FontFamily::Monospace),
-            VSCODE_TEXT_DIM,
-        );
-
-        ui.add_space(EDITOR_GUTTER_GAP);
-        ui.allocate_ui(Vec2::new(text_width, row_height), |ui| {
-            ui.label(RichText::new("Loading...").color(VSCODE_TEXT_DIM));
-        });
-    });
-}
-
 #[derive(Debug, Clone, Copy)]
-struct LargeLineBlockView<'a> {
+struct LargeLineRenderView<'a> {
     row_height: f32,
     text_width: f32,
     editor_font_size: f32,
     search_query: &'a str,
     search_options: SearchOptions,
+    search_pattern: Option<&'a CompiledSearch>,
+    wrap_lines: bool,
 }
 
-fn show_virtual_line_block(
-    ui: &mut egui::Ui,
-    document: &mut LargeDocument,
-    row_range: Range<usize>,
-    view: LargeLineBlockView<'_>,
-) -> Option<LargeEditorAction> {
-    let line_count = row_range.end.saturating_sub(row_range.start);
-
-    if line_count == 0 {
-        return None;
-    }
-
-    let mut message = None;
-    let mut block_text = row_range
-        .clone()
-        .map(|line_index| document.file_line_text(line_index).unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let block_height = view.row_height * line_count as f32;
-
-    ui.horizontal(|ui| {
-        let (line_number_rect, _) =
-            ui.allocate_exact_size(Vec2::new(EDITOR_GUTTER_WIDTH, block_height), Sense::hover());
-
-        for (offset, line_index) in row_range.clone().enumerate() {
-            let number_rect = egui::Rect::from_min_size(
-                egui::pos2(
-                    line_number_rect.left(),
-                    line_number_rect.top() + offset as f32 * view.row_height,
-                ),
-                Vec2::new(EDITOR_GUTTER_WIDTH, view.row_height),
-            );
-            ui.painter().text(
-                line_number_top_pos(number_rect),
-                Align2::RIGHT_TOP,
-                (line_index + 1).to_string(),
-                FontId::new(12.0, FontFamily::Monospace),
-                VSCODE_TEXT_DIM,
-            );
-        }
-
-        ui.add_space(EDITOR_GUTTER_GAP);
-
-        let editor_id = ui.make_persistent_id((
-            "large_line_block_editor",
-            document.path(),
-            row_range.start,
-            row_range.end,
-        ));
-        let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
-            ui.fonts(|fonts| {
-                fonts.layout_job(editor_highlight_layout_job(
-                    text,
-                    large_line_block_layout_width(wrap_width, view.text_width),
-                    view.editor_font_size,
-                    view.search_query,
-                    view.search_options,
-                    None,
-                    &[],
-                ))
-            })
-        };
-        let response = ui.add_sized(
-            Vec2::new(view.text_width, block_height),
-            TextEdit::multiline(&mut block_text)
-                .id(editor_id)
-                .font(editor_font_id(view.editor_font_size))
-                .text_color(VSCODE_TEXT)
-                .desired_width(view.text_width)
-                .desired_rows(line_count)
-                .min_size(Vec2::new(view.text_width, block_height))
-                .lock_focus(true)
-                .margin(Margin::ZERO)
-                .frame(false)
-                .layouter(&mut layouter),
-        );
-
-        if response.changed() {
-            message = apply_large_line_block_edit(document, row_range.clone(), &block_text);
-        }
-    });
-
-    message.map(LargeEditorAction::Message)
+struct LargeLineInteractionState<'a> {
+    editing_line: &'a mut Option<usize>,
+    selection: &'a mut Option<LargeSelection>,
+    dragging: &'a mut bool,
+    galley_cache: &'a mut LargeLineGalleyCache,
 }
 
-fn large_line_block_layout_width(provided_wrap_width: f32, text_width: f32) -> f32 {
-    if text_width.is_finite() {
-        text_width.max(provided_wrap_width)
-    } else {
-        provided_wrap_width
-    }
-}
-
-fn apply_large_line_block_edit(
-    document: &mut LargeDocument,
-    row_range: Range<usize>,
-    block_text: &str,
-) -> Option<AppMessage> {
-    let edited_lines = block_text.split('\n').collect::<Vec<_>>();
-    let expected_line_count = row_range.end.saturating_sub(row_range.start);
-
-    if edited_lines.len() != expected_line_count {
-        return Some(AppMessage::Error(
-            "Large viewport block edits must keep the same line count".to_owned(),
-        ));
-    }
-
-    for line_index in row_range.clone() {
-        if !document.is_file_line_editable(line_index) {
-            return Some(AppMessage::Error(
-                "The visible block includes a partial viewport boundary line".to_owned(),
-            ));
-        }
-    }
-
-    let mut changed = false;
-
-    for (line_index, replacement) in row_range.zip(edited_lines) {
-        let mut replacement = replacement.to_owned();
-        remove_line_breaks(&mut replacement);
-
-        match document.replace_file_line(line_index, &replacement) {
-            Ok(line_changed) => changed |= line_changed,
-            Err(error) => return Some(AppMessage::Error(format!("Edit failed: {error}"))),
-        }
-    }
-
-    changed.then(|| AppMessage::Info("Edited visible line block".to_owned()))
-}
-
-fn show_virtual_line(
+fn show_fast_virtual_line(
     ui: &mut egui::Ui,
     document: &mut LargeDocument,
     line_index: usize,
-    row_height: f32,
-    text_width: f32,
-    wrap_lines: bool,
-    editor_font_size: f32,
+    view: LargeLineRenderView<'_>,
+    state: LargeLineInteractionState<'_>,
 ) -> Option<AppMessage> {
     let mut message = None;
 
     ui.horizontal(|ui| {
-        let (line_number_rect, _) =
-            ui.allocate_exact_size(Vec2::new(EDITOR_GUTTER_WIDTH, row_height), Sense::hover());
+        let (line_number_rect, _) = ui.allocate_exact_size(
+            Vec2::new(EDITOR_GUTTER_WIDTH, view.row_height),
+            Sense::hover(),
+        );
         ui.painter().text(
             line_number_top_pos(line_number_rect),
             Align2::RIGHT_TOP,
@@ -2632,39 +2842,343 @@ fn show_virtual_line(
 
         ui.add_space(EDITOR_GUTTER_GAP);
 
-        let mut line_text = document
-            .file_line_text(line_index)
-            .unwrap_or_default()
-            .to_owned();
         let editable = document.is_file_line_editable(line_index);
-        let editor_id = ui.make_persistent_id(("large_line_editor", document.path(), line_index));
 
-        let response = ui
-            .add_enabled_ui(editable, |ui| {
-                add_line_editor(
-                    ui,
-                    &mut line_text,
-                    text_width,
-                    row_height,
-                    wrap_lines,
-                    editor_font_size,
-                    editor_id,
-                )
-            })
-            .inner;
+        if *state.editing_line == Some(line_index) && editable {
+            let mut line_text = document
+                .display_line_text(line_index)
+                .unwrap_or_default()
+                .to_owned();
+            let editor_id =
+                ui.make_persistent_id(("large_fast_line_editor", document.path(), line_index));
+            let response = add_line_editor(
+                ui,
+                &mut line_text,
+                view.text_width,
+                view.row_height,
+                view.wrap_lines,
+                view.editor_font_size,
+                editor_id,
+            );
 
-        if editable && response.changed() {
-            remove_line_breaks(&mut line_text);
+            if response.lost_focus() {
+                *state.editing_line = None;
+            }
 
-            message = match document.replace_file_line(line_index, &line_text) {
-                Ok(true) => Some(AppMessage::Info(format!("Edited line {}", line_index + 1))),
-                Ok(false) => None,
-                Err(error) => Some(AppMessage::Error(format!("Edit failed: {error}"))),
-            };
+            if response.changed() {
+                remove_line_breaks(&mut line_text);
+
+                message = match document.replace_file_line(line_index, &line_text) {
+                    Ok(true) => Some(AppMessage::Info(format!("Edited line {}", line_index + 1))),
+                    Ok(false) => None,
+                    Err(error) => Some(AppMessage::Error(format!("Edit failed: {error}"))),
+                };
+            }
+
+            return;
+        }
+
+        let (text_rect, _) =
+            ui.allocate_exact_size(Vec2::new(view.text_width, view.row_height), Sense::hover());
+        let text_interaction_rect = large_text_selection_interaction_rect(ui, text_rect);
+        let response = ui.interact(
+            text_interaction_rect,
+            ui.make_persistent_id(("large_line_text_interaction", document.path(), line_index)),
+            Sense::click_and_drag(),
+        );
+
+        if ui.rect_contains_pointer(text_interaction_rect) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+        }
+
+        let Some(line_text) = document.display_line_text(line_index) else {
+            ui.painter().text(
+                text_rect.left_top(),
+                Align2::LEFT_TOP,
+                "Loading...",
+                editor_font_id(view.editor_font_size),
+                VSCODE_TEXT_DIM,
+            );
+            return;
+        };
+        let galley = large_line_display_galley(ui, state.galley_cache, line_index, line_text, view);
+        let line_char_count = line_text.chars().count();
+
+        let painter = ui.painter().with_clip_rect(text_rect);
+
+        if let Some(active) = state.selection.as_ref() {
+            if let Some((start, end)) = active.range_on_line(line_index, line_char_count) {
+                if end > start {
+                    for rect in selection_rects_for_range(&galley, start, end) {
+                        painter.rect_filled(
+                            rect.translate(text_rect.left_top().to_vec2()),
+                            0.0,
+                            VSCODE_SELECTION_HIGHLIGHT,
+                        );
+                    }
+                }
+            }
+        }
+
+        painter.galley(text_rect.left_top(), galley.clone(), VSCODE_TEXT);
+
+        let pointer_pos = ui.ctx().input(|input| input.pointer.interact_pos());
+        let primary_pressed = ui.ctx().input(|input| input.pointer.primary_pressed());
+        let primary_down = ui.ctx().input(|input| input.pointer.primary_down());
+        let shift_held = ui.ctx().input(|input| input.modifiers.shift);
+
+        let char_at_pointer = |pointer_pos: egui::Pos2| -> usize {
+            let clamped_x = pointer_pos.x.clamp(text_rect.left(), text_rect.right());
+            let clamped_y = pointer_pos
+                .y
+                .clamp(text_rect.top(), text_rect.bottom() - 1.0);
+            let relative = egui::pos2(clamped_x, clamped_y) - text_rect.left_top();
+            galley
+                .cursor_from_pos(relative)
+                .ccursor
+                .index
+                .min(line_char_count)
+        };
+
+        if primary_pressed {
+            if let Some(pos) = pointer_pos.filter(|pos| text_interaction_rect.contains(*pos)) {
+                let char = char_at_pointer(pos);
+                start_large_selection(
+                    state.selection,
+                    state.dragging,
+                    LargePos {
+                        line: line_index,
+                        char,
+                    },
+                    shift_held,
+                );
+            }
+        } else if response.drag_started() && !*state.dragging {
+            if let Some(pos) = pointer_pos.filter(|pos| text_interaction_rect.contains(*pos)) {
+                let char = char_at_pointer(pos);
+                start_large_selection(
+                    state.selection,
+                    state.dragging,
+                    LargePos {
+                        line: line_index,
+                        char,
+                    },
+                    shift_held,
+                );
+            }
+        }
+
+        if *state.dragging {
+            if !primary_down {
+                *state.dragging = false;
+            } else if let Some(pos) = pointer_pos {
+                let y_in_row = pos.y >= text_rect.top() && pos.y < text_rect.bottom();
+
+                if y_in_row {
+                    let char = char_at_pointer(pos);
+
+                    if let Some(active) = state.selection.as_mut() {
+                        active.head = LargePos {
+                            line: line_index,
+                            char,
+                        };
+                    }
+                }
+            }
+        }
+
+        if should_place_large_cursor_on_click(response.clicked(), shift_held, *state.selection) {
+            if let Some(pos) = pointer_pos {
+                let char = char_at_pointer(pos);
+                *state.selection = Some(LargeSelection::cursor(LargePos {
+                    line: line_index,
+                    char,
+                }));
+            }
+        }
+
+        if editable && response.double_clicked() {
+            *state.editing_line = Some(line_index);
+            message = Some(AppMessage::Info(format!("Editing line {}", line_index + 1)));
         }
     });
 
     message
+}
+
+fn large_line_display_galley(
+    ui: &egui::Ui,
+    cache: &mut LargeLineGalleyCache,
+    line_index: usize,
+    line_text: &str,
+    view: LargeLineRenderView<'_>,
+) -> Arc<egui::Galley> {
+    let key = large_line_galley_cache_key(line_index, line_text, view);
+
+    cache.get_or_insert_with(key, || {
+        let layout_job = large_line_display_layout_job(line_text, view);
+        ui.fonts(|fonts| fonts.layout_job(layout_job))
+    })
+}
+
+fn large_text_selection_interaction_rect(ui: &egui::Ui, text_rect: egui::Rect) -> egui::Rect {
+    let mut rect = text_rect.intersect(ui.clip_rect());
+    let guard = scrollbar_interaction_guard_width(ui);
+
+    rect.max.x = rect.max.x.min(ui.clip_rect().max.x - guard);
+    rect.max.y = rect.max.y.min(ui.clip_rect().max.y - guard);
+
+    if rect.max.x < rect.min.x {
+        rect.max.x = rect.min.x;
+    }
+    if rect.max.y < rect.min.y {
+        rect.max.y = rect.min.y;
+    }
+
+    rect
+}
+
+fn scrollbar_interaction_guard_width(ui: &egui::Ui) -> f32 {
+    let scroll = &ui.spacing().scroll;
+
+    (scroll.bar_width + scroll.bar_inner_margin + scroll.bar_outer_margin + 2.0).ceil()
+}
+
+fn start_large_selection(
+    selection: &mut Option<LargeSelection>,
+    dragging: &mut bool,
+    head: LargePos,
+    shift_held: bool,
+) {
+    if shift_held {
+        if let Some(active) = selection.as_mut() {
+            active.head = head;
+        } else {
+            *selection = Some(LargeSelection::cursor(head));
+        }
+    } else {
+        *selection = Some(LargeSelection::cursor(head));
+    }
+
+    *dragging = true;
+}
+
+fn large_line_display_layout_job(line_text: &str, view: LargeLineRenderView<'_>) -> LayoutJob {
+    editor_highlight_layout_job(
+        line_text,
+        view.text_width,
+        view.editor_font_size,
+        view.search_pattern,
+        None,
+        &[],
+    )
+}
+
+fn selection_rects_for_range(
+    galley: &Arc<egui::Galley>,
+    start_char: usize,
+    end_char: usize,
+) -> Vec<egui::Rect> {
+    if end_char <= start_char {
+        return Vec::new();
+    }
+
+    let start_rect = galley.pos_from_ccursor(CCursor::new(start_char));
+    let end_rect = galley.pos_from_ccursor(CCursor::new(end_char));
+
+    if (start_rect.min.y - end_rect.min.y).abs() < f32::EPSILON {
+        return vec![egui::Rect::from_min_max(
+            egui::pos2(start_rect.min.x, start_rect.min.y),
+            egui::pos2(end_rect.min.x, start_rect.max.y),
+        )];
+    }
+
+    let mut rects = Vec::new();
+
+    for row in &galley.rows {
+        let row_min_y = row.min_y();
+
+        if row.max_y() <= start_rect.min.y {
+            continue;
+        }
+
+        if row_min_y >= end_rect.max.y {
+            break;
+        }
+
+        let start_x = if row_min_y <= start_rect.min.y && start_rect.min.y < row.max_y() {
+            start_rect.min.x
+        } else {
+            row.rect.min.x
+        };
+        let end_x = if row_min_y <= end_rect.min.y && end_rect.min.y < row.max_y() {
+            end_rect.min.x
+        } else {
+            row.rect.max.x
+        };
+
+        if end_x > start_x {
+            rects.push(egui::Rect::from_min_max(
+                egui::pos2(start_x, row_min_y),
+                egui::pos2(end_x, row.max_y()),
+            ));
+        }
+    }
+
+    rects
+}
+
+fn collect_large_selection_text(
+    document: &LargeDocument,
+    selection: LargeSelection,
+) -> Option<String> {
+    let (start, end) = selection.ordered();
+
+    if start == end {
+        return Some(String::new());
+    }
+
+    let mut buffer = String::new();
+
+    for line in start.line..=end.line {
+        let line_text = document.display_line_text(line)?;
+
+        if start.line == end.line {
+            let slice = slice_characters(line_text, start.char, end.char);
+            buffer.push_str(&slice);
+        } else if line == start.line {
+            let slice = slice_characters(line_text, start.char, line_text.chars().count());
+            buffer.push_str(&slice);
+            buffer.push('\n');
+        } else if line == end.line {
+            let slice = slice_characters(line_text, 0, end.char);
+            buffer.push_str(&slice);
+        } else {
+            buffer.push_str(line_text);
+            buffer.push('\n');
+        }
+    }
+
+    Some(buffer)
+}
+
+fn is_copyable_large_selection(selection: Option<LargeSelection>) -> bool {
+    selection.is_some_and(|selection| !selection.is_cursor())
+}
+
+fn should_place_large_cursor_on_click(
+    clicked: bool,
+    shift_held: bool,
+    selection: Option<LargeSelection>,
+) -> bool {
+    clicked && !shift_held && !is_copyable_large_selection(selection)
+}
+
+fn slice_characters(text: &str, start_char: usize, end_char: usize) -> String {
+    text.chars()
+        .skip(start_char)
+        .take(end_char.saturating_sub(start_char))
+        .collect()
 }
 
 fn line_number_top_pos(line_number_rect: egui::Rect) -> egui::Pos2 {
@@ -2733,16 +3247,21 @@ fn editor_highlight_layout_job(
     text: &str,
     wrap_width: f32,
     editor_font_size: f32,
-    search_query: &str,
-    search_options: SearchOptions,
+    search_pattern: Option<&CompiledSearch>,
     primary_selection: Option<TextSelection>,
     multi_selections: &[TextSelection],
 ) -> LayoutJob {
-    let mut ranges = syntax_highlight_ranges(text);
-    ranges.extend(search_highlight_ranges(text, search_query, search_options));
-    ranges.extend(word_highlight_ranges(text, primary_selection));
+    let rich_highlights_enabled = should_build_rich_highlights(text);
+    let mut ranges = Vec::new();
+
+    if rich_highlights_enabled {
+        ranges.extend(syntax_highlight_ranges(text));
+        ranges.extend(search_highlight_ranges(text, search_pattern));
+        ranges.extend(word_highlight_ranges(text, primary_selection));
+        ranges.extend(bracket_highlight_ranges(text, primary_selection));
+    }
+
     ranges.extend(selection_highlight_ranges(text, multi_selections));
-    ranges.extend(bracket_highlight_ranges(text, primary_selection));
 
     let mut boundaries = vec![0, text.len()];
     for highlight in &ranges {
@@ -2794,6 +3313,10 @@ fn editor_highlight_layout_job(
     }
 
     layout_job
+}
+
+fn should_build_rich_highlights(text: &str) -> bool {
+    text.len() <= MAX_RICH_HIGHLIGHT_BYTES
 }
 
 fn syntax_highlight_ranges(text: &str) -> Vec<HighlightRange> {
@@ -2891,25 +3414,21 @@ fn syntax_highlight_ranges(text: &str) -> Vec<HighlightRange> {
 
 fn search_highlight_ranges(
     text: &str,
-    search_query: &str,
-    search_options: SearchOptions,
+    search_pattern: Option<&CompiledSearch>,
 ) -> Vec<HighlightRange> {
-    if search_query.is_empty() {
+    let Some(search_pattern) = search_pattern else {
         return Vec::new();
-    }
+    };
 
-    find_text_matches(text, search_query, search_options, HIGHLIGHT_SEARCH_LIMIT)
-        .map(|matches| {
-            matches
-                .into_iter()
-                .map(|search_match| HighlightRange {
-                    range: search_match.range,
-                    foreground: None,
-                    background: Some(VSCODE_HIGHLIGHT),
-                })
-                .collect()
+    search_pattern
+        .find_matches(text, HIGHLIGHT_SEARCH_LIMIT)
+        .into_iter()
+        .map(|search_match| HighlightRange {
+            range: search_match.range,
+            foreground: None,
+            background: Some(VSCODE_HIGHLIGHT),
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 fn selection_highlight_ranges(text: &str, selections: &[TextSelection]) -> Vec<HighlightRange> {
@@ -2948,7 +3467,7 @@ fn word_highlight_ranges(
     };
     let word = editor_ops::selected_text(text, selection);
 
-    if word.is_empty() {
+    if !should_auto_highlight_selection(&word) {
         return Vec::new();
     }
 
@@ -2962,6 +3481,15 @@ fn word_highlight_ranges(
             background: Some(Color32::from_rgb(0x33, 0x3f, 0x4f)),
         })
         .collect()
+}
+
+fn should_auto_highlight_selection(selection_text: &str) -> bool {
+    !selection_text.is_empty()
+        && selection_text.len() <= AUTO_WORD_HIGHLIGHT_MAX_BYTES
+        && !selection_text
+            .as_bytes()
+            .iter()
+            .any(|byte| matches!(byte, b'\n' | b'\r'))
 }
 
 fn bracket_highlight_ranges(
@@ -3209,6 +3737,65 @@ fn collect_shortcut_actions(context: &egui::Context) -> Vec<ShortcutAction> {
     actions
 }
 
+fn should_submit_search(find_clicked: bool, query_has_focus: bool, enter_pressed: bool) -> bool {
+    find_clicked || (query_has_focus && enter_pressed)
+}
+
+fn search_panel_content_height(sidebar_available_height: f32, editor_content_height: f32) -> f32 {
+    let fallback = sidebar_available_height.max(0.0);
+
+    if editor_content_height.is_finite() && editor_content_height > 0.0 {
+        fallback.min(editor_content_height)
+    } else {
+        fallback
+    }
+}
+
+fn search_result_list_height(available_height: f32, result_count: usize, row_height: f32) -> f32 {
+    if result_count == 0 {
+        return row_height;
+    }
+
+    let desired = result_count as f32 * row_height;
+    let minimum = SEARCH_RESULT_MIN_VISIBLE_ROWS as f32 * row_height;
+
+    if available_height.is_finite() && available_height > 0.0 {
+        desired
+            .min(available_height)
+            .max(minimum.min(available_height))
+    } else {
+        minimum
+    }
+}
+
+fn search_result_scroll_bar_visibility(
+    result_count: usize,
+    list_height: f32,
+    row_height: f32,
+) -> ScrollBarVisibility {
+    let content_height = result_count as f32 * row_height;
+
+    if content_height > list_height + f32::EPSILON {
+        ScrollBarVisibility::AlwaysVisible
+    } else {
+        ScrollBarVisibility::VisibleWhenNeeded
+    }
+}
+
+fn consume_copy_request(input: &mut egui::InputState) -> bool {
+    if let Some(copy_event_index) = input
+        .raw
+        .events
+        .iter()
+        .position(|event| matches!(event, egui::Event::Copy))
+    {
+        input.raw.events.remove(copy_event_index);
+        true
+    } else {
+        input.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, egui::Key::C))
+    }
+}
+
 fn take_multi_cursor_text_edits(context: &egui::Context) -> Vec<InlineInputEdit> {
     let mut edits = Vec::new();
 
@@ -3372,6 +3959,20 @@ fn editor_content_width_for_text(
     wrap_lines: bool,
     editor_font_size: f32,
 ) -> f32 {
+    editor_content_width_for_line_columns(
+        longest_line_character_count(text),
+        available_width,
+        wrap_lines,
+        editor_font_size,
+    )
+}
+
+fn editor_content_width_for_line_columns(
+    longest_line_columns: usize,
+    available_width: f32,
+    wrap_lines: bool,
+    editor_font_size: f32,
+) -> f32 {
     let minimum_width = if wrap_lines {
         EDITOR_GUTTER_WIDTH + EDITOR_GUTTER_GAP + EDITOR_MIN_WRAP_TEXT_WIDTH
     } else {
@@ -3387,8 +3988,7 @@ fn editor_content_width_for_text(
         return available_width;
     }
 
-    let text_width =
-        editor_text_width_for_characters(longest_line_character_count(text), editor_font_size);
+    let text_width = editor_text_width_for_characters(longest_line_columns, editor_font_size);
 
     (EDITOR_GUTTER_WIDTH + EDITOR_GUTTER_GAP + text_width).max(available_width)
 }
@@ -3411,15 +4011,7 @@ fn editor_line_row_height_for_ui(
 }
 
 fn editor_line_layout_job(text: &str, wrap_width: f32, editor_font_size: f32) -> LayoutJob {
-    editor_highlight_layout_job(
-        text,
-        wrap_width,
-        editor_font_size,
-        "",
-        SearchOptions::default(),
-        None,
-        &[],
-    )
+    editor_highlight_layout_job(text, wrap_width, editor_font_size, None, None, &[])
 }
 
 fn editor_font_id(editor_font_size: f32) -> FontId {
@@ -3633,6 +4225,152 @@ mod tests {
     }
 
     #[test]
+    fn search_submit_requires_find_click_or_enter_in_query_field() {
+        assert!(!should_submit_search(false, false, false));
+        assert!(!should_submit_search(false, false, true));
+        assert!(!should_submit_search(false, true, false));
+        assert!(should_submit_search(false, true, true));
+        assert!(should_submit_search(true, false, false));
+    }
+
+    #[test]
+    fn search_draft_change_clears_executed_highlight_state() {
+        let mut state = SearchPanelState::default();
+        let options = SearchOptions {
+            match_case: true,
+            ..SearchOptions::default()
+        };
+
+        state.record_successful_search(
+            "alpha".to_owned(),
+            options,
+            CompiledSearch::new("alpha", options).unwrap(),
+            vec![SearchResultRow {
+                line_number: 1,
+                line_index: 0,
+                preview_byte_index: 0,
+                preview_byte_offset_in_line: 0,
+            }],
+            "document",
+        );
+        assert_eq!(state.highlight_query(), "alpha");
+        assert!(state.executed_options().match_case);
+        assert!(state.highlight_pattern().is_some());
+
+        state.query = "beta".to_owned();
+        state.clear_executed_search();
+
+        assert_eq!(state.highlight_query(), "");
+        assert_eq!(state.executed_options(), SearchOptions::default());
+        assert!(state.highlight_pattern().is_none());
+        assert!(state.results.is_empty());
+        assert!(state.searched_scope.is_none());
+    }
+
+    #[test]
+    fn run_search_keeps_all_results_instead_of_truncating_to_legacy_limit() {
+        let text = (0..250).map(|_| "hit").collect::<Vec<_>>().join("\n");
+        let mut app = PhantomApp {
+            document: ActiveDocument::Inline(EditorDocument::from_saved_text(
+                PathBuf::from("sample.txt"),
+                text,
+            )),
+            ..Default::default()
+        };
+        app.search.query = "hit".to_owned();
+
+        app.run_search();
+
+        assert_eq!(app.search.results.len(), 250);
+        assert_eq!(app.search.highlight_query(), "hit");
+        assert!(app.search.highlight_pattern().is_some());
+    }
+
+    #[test]
+    fn run_search_scans_entire_clean_large_file_not_only_viewport() -> std::io::Result<()> {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("phantom-search-large-{unique}.json"));
+        let mut payload = String::from("{\n");
+        for index in 0..1_000 {
+            payload.push_str(&format!(r#"  "field_{index}": "value_{index}","#));
+            payload.push('\n');
+        }
+        payload.push_str(r#"  "params": {"needle": true}"#);
+        payload.push_str("\n}\n");
+        std::fs::write(&path, payload)?;
+
+        let document = phantom::open_large_document_with_viewport(&path, 128)?;
+        assert!(document.viewport_text().find("params").is_none());
+        let mut app = PhantomApp {
+            document: ActiveDocument::Large(Box::new(document)),
+            ..Default::default()
+        };
+        app.search.query = "params".to_owned();
+
+        app.run_search();
+
+        assert_eq!(app.search.searched_scope, Some("file"));
+        assert_eq!(app.search.results.len(), 1);
+        assert!(app
+            .search_result_preview(&app.search.results[0])
+            .contains("params"));
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn replacing_document_clears_executed_search_state() {
+        let mut app = PhantomApp::default();
+        app.search.record_successful_search(
+            "stale".to_owned(),
+            SearchOptions::default(),
+            CompiledSearch::new("stale", SearchOptions::default()).unwrap(),
+            vec![SearchResultRow {
+                line_number: 1,
+                line_index: 0,
+                preview_byte_index: 0,
+                preview_byte_offset_in_line: 0,
+            }],
+            "document",
+        );
+
+        app.apply_open_result(OpenTaskResult::Opened(OpenedDocument::Inline(
+            EditorDocument::from_saved_text(PathBuf::from("fresh.txt"), "fresh".to_owned()),
+        )));
+
+        assert_eq!(app.search.highlight_query(), "");
+        assert!(app.search.results.is_empty());
+        assert!(app.search.searched_scope.is_none());
+    }
+
+    #[test]
+    fn new_document_clears_executed_search_state() {
+        let mut app = PhantomApp::default();
+        app.search.record_successful_search(
+            "stale".to_owned(),
+            SearchOptions::default(),
+            CompiledSearch::new("stale", SearchOptions::default()).unwrap(),
+            vec![SearchResultRow {
+                line_number: 1,
+                line_index: 0,
+                preview_byte_index: 0,
+                preview_byte_offset_in_line: 0,
+            }],
+            "document",
+        );
+
+        app.new_document();
+
+        assert_eq!(app.search.highlight_query(), "");
+        assert!(app.search.results.is_empty());
+        assert!(app.search.searched_scope.is_none());
+    }
+
+    #[test]
     fn line_start_char_index_finds_target_line_start() {
         assert_eq!(line_start_char_index("alpha\nbeta\ngamma", 0), 0);
         assert_eq!(line_start_char_index("alpha\nbeta\ngamma", 1), 6);
@@ -3692,12 +4430,12 @@ mod tests {
 
     #[test]
     fn highlight_layout_marks_search_and_selection_backgrounds() {
+        let search = CompiledSearch::new("alpha", SearchOptions::default()).unwrap();
         let layout_job = editor_highlight_layout_job(
             "let alpha = \"alpha\";",
             320.0,
             DEFAULT_EDITOR_FONT_SIZE,
-            "alpha",
-            SearchOptions::default(),
+            Some(&search),
             Some(TextSelection::new(0, 3)),
             &[TextSelection::new(0, 3)],
         );
@@ -3719,6 +4457,23 @@ mod tests {
             .sections
             .iter()
             .any(|section| section.format.color == SYNTAX_STRING));
+    }
+
+    #[test]
+    fn auto_word_highlight_rejects_large_or_multiline_selection() {
+        let oversized = "x".repeat(AUTO_WORD_HIGHLIGHT_MAX_BYTES + 1);
+
+        assert!(should_auto_highlight_selection("alpha"));
+        assert!(!should_auto_highlight_selection(&oversized));
+        assert!(!should_auto_highlight_selection("alpha\nbeta"));
+    }
+
+    #[test]
+    fn word_highlight_skips_oversized_selection() {
+        let word = "x".repeat(AUTO_WORD_HIGHLIGHT_MAX_BYTES + 1);
+        let text = format!("{word} {word}");
+
+        assert!(word_highlight_ranges(&text, Some(TextSelection::new(0, word.len()))).is_empty());
     }
 
     #[test]
@@ -3763,42 +4518,370 @@ mod tests {
     }
 
     #[test]
-    fn large_line_block_edit_updates_multiple_visible_lines() -> std::io::Result<()> {
-        let path = unique_main_temp_path("large_line_block_edit.txt");
-        std::fs::write(&path, "alpha\nbeta\ngamma")?;
-        let mut document = phantom::open_large_document_with_viewport(&path, 64)?;
+    fn large_line_display_layout_uses_fast_no_wrap_width() {
+        let view = LargeLineRenderView {
+            row_height: EDITOR_ROW_HEIGHT,
+            text_width: 2_400.0,
+            editor_font_size: DEFAULT_EDITOR_FONT_SIZE,
+            search_query: "",
+            search_options: SearchOptions::default(),
+            search_pattern: None,
+            wrap_lines: false,
+        };
+        let layout_job = large_line_display_layout_job("alpha", view);
 
-        let message = apply_large_line_block_edit(&mut document, 0..2, "ALPHA\nBETA");
+        assert_eq!(layout_job.wrap.max_width, 2_400.0);
+        assert!(layout_job
+            .sections
+            .iter()
+            .all(|section| section.format.line_height == Some(EDITOR_ROW_HEIGHT)));
+    }
 
-        assert!(matches!(message, Some(AppMessage::Info(_))));
-        assert_eq!(document.file_line_text(0), Some("ALPHA"));
-        assert_eq!(document.file_line_text(1), Some("BETA"));
-        assert_eq!(document.file_line_text(2), Some("gamma"));
+    #[test]
+    fn large_line_galley_cache_reuses_identical_layouts() {
+        egui::__run_test_ui(|ui| {
+            let view = LargeLineRenderView {
+                row_height: EDITOR_ROW_HEIGHT,
+                text_width: 2_400.0,
+                editor_font_size: DEFAULT_EDITOR_FONT_SIZE,
+                search_query: "",
+                search_options: SearchOptions::default(),
+                search_pattern: None,
+                wrap_lines: false,
+            };
+            let mut cache = LargeLineGalleyCache::default();
+
+            let first = large_line_display_galley(ui, &mut cache, 10, "alpha", view);
+            let second = large_line_display_galley(ui, &mut cache, 10, "alpha", view);
+            let changed = large_line_display_galley(ui, &mut cache, 10, "alpha beta", view);
+
+            assert!(Arc::ptr_eq(&first, &second));
+            assert!(!Arc::ptr_eq(&first, &changed));
+            assert_eq!(cache.len(), 2);
+        });
+    }
+
+    #[test]
+    fn large_line_galley_cache_key_changes_with_search_options() {
+        let default_view = LargeLineRenderView {
+            row_height: EDITOR_ROW_HEIGHT,
+            text_width: 2_400.0,
+            editor_font_size: DEFAULT_EDITOR_FONT_SIZE,
+            search_query: "alpha",
+            search_options: SearchOptions::default(),
+            search_pattern: None,
+            wrap_lines: false,
+        };
+        let case_sensitive_view = LargeLineRenderView {
+            search_options: SearchOptions {
+                match_case: true,
+                ..SearchOptions::default()
+            },
+            ..default_view
+        };
+
+        assert_ne!(
+            large_line_galley_cache_key(1, "alpha", default_view),
+            large_line_galley_cache_key(1, "alpha", case_sensitive_view)
+        );
+    }
+
+    #[test]
+    fn large_selection_range_on_line_handles_single_line() {
+        let selection = LargeSelection {
+            anchor: LargePos { line: 3, char: 4 },
+            head: LargePos { line: 3, char: 10 },
+        };
+
+        assert_eq!(selection.range_on_line(3, 20), Some((4, 10)));
+        assert_eq!(selection.range_on_line(2, 20), None);
+    }
+
+    #[test]
+    fn large_selection_range_on_line_handles_multi_line() {
+        let selection = LargeSelection {
+            anchor: LargePos { line: 1, char: 5 },
+            head: LargePos { line: 3, char: 2 },
+        };
+
+        assert_eq!(selection.range_on_line(1, 8), Some((5, 8)));
+        assert_eq!(selection.range_on_line(2, 6), Some((0, 6)));
+        assert_eq!(selection.range_on_line(3, 9), Some((0, 2)));
+    }
+
+    #[test]
+    fn large_selection_range_handles_reversed_anchor_and_head() {
+        let selection = LargeSelection {
+            anchor: LargePos { line: 4, char: 3 },
+            head: LargePos { line: 2, char: 1 },
+        };
+
+        assert_eq!(selection.range_on_line(2, 5), Some((1, 5)));
+        assert_eq!(selection.range_on_line(3, 5), Some((0, 5)));
+        assert_eq!(selection.range_on_line(4, 5), Some((0, 3)));
+    }
+
+    #[test]
+    fn slice_characters_preserves_utf8_boundaries() {
+        assert_eq!(slice_characters("éclair 🍰", 0, 6), "éclair");
+        assert_eq!(slice_characters("éclair 🍰", 7, 8), "🍰");
+    }
+
+    #[test]
+    fn collect_large_selection_text_joins_multiple_lines() -> std::io::Result<()> {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("phantom-collect-{unique}.txt"));
+
+        std::fs::write(&path, "alpha\nbravo\ncharlie")?;
+        let document = phantom::open_large_document_with_viewport(&path, 64)?;
+
+        let selection = LargeSelection {
+            anchor: LargePos { line: 0, char: 2 },
+            head: LargePos { line: 2, char: 3 },
+        };
+
+        let text = collect_large_selection_text(&document, selection).expect("loaded selection");
+
+        assert_eq!(text, "pha\nbravo\ncha");
 
         std::fs::remove_file(path)?;
         Ok(())
     }
 
     #[test]
-    fn large_line_block_edit_rejects_line_count_changes() -> std::io::Result<()> {
-        let path = unique_main_temp_path("large_line_block_edit_line_count.txt");
-        std::fs::write(&path, "alpha\nbeta\ngamma")?;
-        let mut document = phantom::open_large_document_with_viewport(&path, 64)?;
+    fn collect_large_selection_text_reads_clean_lines_outside_viewport() -> std::io::Result<()> {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("phantom-collect-direct-{unique}.txt"));
+        let mut payload = String::new();
+        for line in 0..2_000 {
+            payload.push_str(&format!("line-{line:04}\n"));
+        }
+        std::fs::write(&path, payload)?;
+        let document = phantom::open_large_document_with_viewport(&path, 128)?;
 
-        let message = apply_large_line_block_edit(&mut document, 0..2, "ALPHA\nBETA\nEXTRA");
+        assert!(!document.contains_file_line(1_998));
+        let selection = LargeSelection {
+            anchor: LargePos {
+                line: 1_998,
+                char: 5,
+            },
+            head: LargePos {
+                line: 1_999,
+                char: 9,
+            },
+        };
 
-        assert!(matches!(message, Some(AppMessage::Error(_))));
-        assert_eq!(document.file_line_text(0), Some("alpha"));
-        assert_eq!(document.file_line_text(1), Some("beta"));
+        let text = collect_large_selection_text(&document, selection).expect("direct selection");
+
+        assert_eq!(text, "1998\nline-1999");
 
         std::fs::remove_file(path)?;
         Ok(())
     }
 
     #[test]
-    fn large_line_block_layout_uses_full_text_width_to_prevent_wrapping() {
-        assert_eq!(large_line_block_layout_width(320.0, 2_400.0), 2_400.0);
-        assert_eq!(large_line_block_layout_width(640.0, 320.0), 640.0);
+    fn copy_large_selection_writes_selected_text_to_platform_output() -> std::io::Result<()> {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("phantom-copy-large-{unique}.txt"));
+        std::fs::write(&path, "alpha\nbravo\ncharlie")?;
+        let document = phantom::open_large_document_with_viewport(&path, 64)?;
+
+        egui::__run_test_ui(|ui| {
+            let mut app = PhantomApp {
+                document: ActiveDocument::Large(Box::new(document.clone())),
+                large_selection: Some(LargeSelection {
+                    anchor: LargePos { line: 0, char: 2 },
+                    head: LargePos { line: 2, char: 3 },
+                }),
+                ..Default::default()
+            };
+
+            app.copy_large_selection(ui.ctx());
+            let copied = ui.ctx().output(|output| {
+                output.commands.iter().find_map(|command| match command {
+                    egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                    _ => None,
+                })
+            });
+
+            assert_eq!(copied.as_deref(), Some("pha\nbravo\ncha"));
+            assert!(matches!(app.message, AppMessage::Info(_)));
+        });
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn large_copy_shortcut_is_available_only_for_non_cursor_large_selection() {
+        assert!(!is_copyable_large_selection(None));
+        assert!(!is_copyable_large_selection(Some(LargeSelection::cursor(
+            LargePos { line: 1, char: 2 }
+        ))));
+        assert!(is_copyable_large_selection(Some(LargeSelection {
+            anchor: LargePos { line: 1, char: 2 },
+            head: LargePos { line: 1, char: 5 },
+        })));
+    }
+
+    #[test]
+    fn large_copy_handler_consumes_platform_copy_event() {
+        let context = egui::Context::default();
+
+        context.input_mut(|input| {
+            input.raw.events.push(egui::Event::Copy);
+
+            assert!(consume_copy_request(input));
+            assert!(!input
+                .raw
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Copy)));
+        });
+    }
+
+    #[test]
+    fn virtualized_search_result_row_uses_fixed_height() {
+        egui::__run_test_ui(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let before = ui.cursor().top();
+            let row_height = editor_row_height(DEFAULT_EDITOR_FONT_SIZE);
+            PhantomApp::show_search_result_row(
+                ui,
+                &SearchResultRow {
+                    line_number: 123,
+                    line_index: 122,
+                    preview_byte_index: 0,
+                    preview_byte_offset_in_line: 0,
+                },
+                r#""params": {"#,
+                row_height,
+                DEFAULT_EDITOR_FONT_SIZE,
+            );
+
+            assert_eq!(ui.cursor().top(), before + row_height);
+        });
+    }
+
+    #[test]
+    fn search_result_list_height_keeps_multiple_rows_visible() {
+        let row_height = editor_row_height(DEFAULT_EDITOR_FONT_SIZE);
+        let eight_rows = row_height * SEARCH_RESULT_MIN_VISIBLE_ROWS as f32;
+
+        assert_eq!(
+            search_result_list_height(1_000.0, 10_000, row_height),
+            1_000.0
+        );
+        assert_eq!(search_result_list_height(120.0, 10_000, row_height), 120.0);
+        assert_eq!(
+            search_result_list_height(1_000.0, 2, row_height),
+            eight_rows
+        );
+        assert_eq!(
+            search_result_list_height(f32::INFINITY, 10_000, row_height),
+            eight_rows
+        );
+    }
+
+    #[test]
+    fn search_result_scrollbar_is_visible_when_results_overflow() {
+        let row_height = editor_row_height(DEFAULT_EDITOR_FONT_SIZE);
+
+        assert_eq!(
+            search_result_scroll_bar_visibility(100, row_height * 8.0, row_height),
+            ScrollBarVisibility::AlwaysVisible
+        );
+        assert_eq!(
+            search_result_scroll_bar_visibility(8, row_height * 8.0, row_height),
+            ScrollBarVisibility::VisibleWhenNeeded
+        );
+        assert_eq!(
+            search_result_scroll_bar_visibility(0, row_height, row_height),
+            ScrollBarVisibility::VisibleWhenNeeded
+        );
+    }
+
+    #[test]
+    fn search_panel_content_height_tracks_editor_height_without_overflowing_sidebar() {
+        assert_eq!(search_panel_content_height(900.0, 640.0), 640.0);
+        assert_eq!(search_panel_content_height(480.0, 640.0), 480.0);
+        assert_eq!(search_panel_content_height(480.0, 0.0), 480.0);
+        assert_eq!(search_panel_content_height(480.0, f32::INFINITY), 480.0);
+    }
+
+    #[test]
+    fn search_panel_ui_reserves_exact_vertical_height() {
+        egui::__run_test_ui(|ui| {
+            let content_height = search_panel_content_height(900.0, 640.0);
+
+            let inner = ui.vertical(|ui| {
+                ui.set_height(content_height);
+                ui.label("Find");
+            });
+
+            assert_eq!(inner.response.rect.height(), content_height);
+        });
+    }
+
+    #[test]
+    fn search_result_preview_uses_only_result_line_for_large_documents() -> std::io::Result<()> {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("phantom-search-preview-{unique}.json"));
+        let text = "{\n  \"alpha\": 1,\n  \"params\": {\"x\": true}\n}\n";
+        std::fs::write(&path, text)?;
+        let document = phantom::open_large_document_with_viewport(&path, 8)?;
+        let app = PhantomApp {
+            document: ActiveDocument::Large(Box::new(document)),
+            search: SearchPanelState {
+                searched_scope: Some("file"),
+                ..SearchPanelState::default()
+            },
+            ..Default::default()
+        };
+        let line_text = "  \"params\": {\"x\": true}";
+        let result = SearchResultRow {
+            line_number: 3,
+            line_index: 2,
+            preview_byte_index: text.find("params").expect("params in file"),
+            preview_byte_offset_in_line: line_text.find("params").expect("params in line"),
+        };
+
+        assert_eq!(app.search_result_preview(&result), line_text);
+
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn clicked_release_does_not_collapse_drag_selection_before_copy() {
+        let drag_selection = Some(LargeSelection {
+            anchor: LargePos { line: 42, char: 2 },
+            head: LargePos { line: 42, char: 8 },
+        });
+
+        assert!(!should_place_large_cursor_on_click(
+            true,
+            false,
+            drag_selection
+        ));
+        assert!(is_copyable_large_selection(drag_selection));
+        assert!(should_place_large_cursor_on_click(
+            true,
+            false,
+            Some(LargeSelection::cursor(LargePos { line: 42, char: 2 }))
+        ));
     }
 
     #[test]
@@ -3813,13 +4896,28 @@ mod tests {
     }
 
     #[test]
+    fn large_longest_columns_cache_never_shrinks_between_viewport_swaps() {
+        let mut cache: usize = 0;
+
+        let mut update = |viewport_longest: usize| {
+            let stable = viewport_longest.max(cache);
+            cache = stable;
+            stable
+        };
+
+        assert_eq!(update(120), 120);
+        assert_eq!(update(40), 120);
+        assert_eq!(update(300), 300);
+        assert_eq!(update(50), 300);
+    }
+
+    #[test]
     fn highlighted_layout_uses_virtual_editor_row_height() {
         let layout_job = editor_highlight_layout_job(
             "alpha\nbeta",
             320.0,
             DEFAULT_EDITOR_FONT_SIZE,
-            "",
-            SearchOptions::default(),
+            None,
             None,
             &[],
         );
@@ -3830,13 +4928,55 @@ mod tests {
             .all(|section| section.format.line_height == Some(EDITOR_ROW_HEIGHT)));
     }
 
-    fn unique_main_temp_path(name: &str) -> PathBuf {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock should be after Unix epoch")
-            .as_nanos();
+    #[test]
+    fn large_content_width_uses_cached_longest_line_columns() {
+        let width =
+            editor_content_width_for_line_columns(2_000, 480.0, false, DEFAULT_EDITOR_FONT_SIZE);
 
-        std::env::temp_dir().join(format!("phantom-main-{unique}-{name}"))
+        assert_eq!(
+            width,
+            EDITOR_GUTTER_WIDTH
+                + EDITOR_GUTTER_GAP
+                + editor_text_width_for_characters(2_000, DEFAULT_EDITOR_FONT_SIZE)
+        );
+    }
+
+    #[test]
+    fn rich_highlights_are_disabled_for_large_text_blocks() {
+        let large_text = "x".repeat(MAX_RICH_HIGHLIGHT_BYTES + 1);
+        let search = CompiledSearch::new("x", SearchOptions::default()).unwrap();
+        let layout_job = editor_highlight_layout_job(
+            &large_text,
+            320.0,
+            DEFAULT_EDITOR_FONT_SIZE,
+            Some(&search),
+            Some(TextSelection::new(0, 1)),
+            &[],
+        );
+
+        assert!(!should_build_rich_highlights(&large_text));
+        assert!(!layout_job
+            .sections
+            .iter()
+            .any(|section| section.format.background == VSCODE_HIGHLIGHT));
+    }
+
+    #[test]
+    fn selection_highlight_remains_for_large_text_blocks() {
+        let large_text = "x".repeat(MAX_RICH_HIGHLIGHT_BYTES + 1);
+        let layout_job = editor_highlight_layout_job(
+            &large_text,
+            320.0,
+            DEFAULT_EDITOR_FONT_SIZE,
+            None,
+            None,
+            &[TextSelection::new(0, 4)],
+        );
+
+        assert!(layout_job
+            .sections
+            .iter()
+            .any(|section| section.format.background == VSCODE_SELECTION_HIGHLIGHT));
     }
 
     #[test]
@@ -3852,10 +4992,10 @@ mod tests {
     }
 
     #[test]
-    fn should_block_close_while_viewport_worker_is_running() {
+    fn should_block_close_while_save_worker_is_running() {
         let (_sender, receiver) = mpsc::channel();
         let app = PhantomApp {
-            viewport_receiver: Some(receiver),
+            save_receiver: Some(receiver),
             ..Default::default()
         };
 
@@ -4030,6 +5170,118 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_ui_stays_at_bottom_when_measured_height_grows() {
+        egui::__run_test_ui(|ui| {
+            let before_height = EDITOR_ROW_HEIGHT * 10_000.0;
+            let after_height = before_height + EDITOR_ROW_HEIGHT * 40.0;
+            let viewport = egui::Rect::from_min_max(
+                egui::pos2(0.0, before_height - EDITOR_ROW_HEIGHT * 30.0),
+                egui::pos2(640.0, before_height),
+            );
+
+            assert!(is_virtual_scroll_at_bottom(
+                viewport,
+                before_height,
+                EDITOR_ROW_HEIGHT,
+            ));
+
+            let bottom_rect = virtual_bottom_scroll_rect(ui, 640.0, after_height);
+            assert!(bottom_rect.max.y > ui.max_rect().top() + before_height);
+            assert_eq!(bottom_rect.height(), 1.0);
+        });
+    }
+
+    #[test]
+    fn large_selection_ui_starts_on_press_without_drag_threshold() {
+        egui::__run_test_ui(|_ui| {
+            let mut selection = None;
+            let mut dragging = false;
+
+            start_large_selection(
+                &mut selection,
+                &mut dragging,
+                LargePos {
+                    line: 99_999,
+                    char: 4,
+                },
+                false,
+            );
+
+            assert!(dragging);
+            assert_eq!(
+                selection,
+                Some(LargeSelection::cursor(LargePos {
+                    line: 99_999,
+                    char: 4
+                }))
+            );
+
+            start_large_selection(
+                &mut selection,
+                &mut dragging,
+                LargePos {
+                    line: 100_000,
+                    char: 8,
+                },
+                true,
+            );
+
+            assert_eq!(
+                selection,
+                Some(LargeSelection {
+                    anchor: LargePos {
+                        line: 99_999,
+                        char: 4
+                    },
+                    head: LargePos {
+                        line: 100_000,
+                        char: 8
+                    },
+                })
+            );
+        });
+    }
+
+    #[test]
+    fn large_text_selection_interaction_rect_excludes_scrollbar_gutters() {
+        egui::__run_test_ui(|ui| {
+            let clip_rect =
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(400.0, 300.0));
+            ui.set_clip_rect(clip_rect);
+            let text_rect =
+                egui::Rect::from_min_max(egui::pos2(72.0, 44.0), egui::pos2(2_000.0, 66.0));
+
+            let interaction_rect = large_text_selection_interaction_rect(ui, text_rect);
+            let guard = scrollbar_interaction_guard_width(ui);
+
+            assert_eq!(interaction_rect.left(), text_rect.left());
+            assert_eq!(interaction_rect.top(), text_rect.top());
+            assert_eq!(interaction_rect.right(), clip_rect.right() - guard);
+            assert_eq!(interaction_rect.bottom(), text_rect.bottom());
+            assert!(!interaction_rect.contains(egui::pos2(clip_rect.right() - 1.0, 55.0)));
+            assert!(interaction_rect.contains(egui::pos2(clip_rect.right() - guard - 1.0, 55.0)));
+        });
+    }
+
+    #[test]
+    fn large_text_selection_interaction_rect_excludes_bottom_scrollbar_gutter() {
+        egui::__run_test_ui(|ui| {
+            let clip_rect =
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(400.0, 300.0));
+            ui.set_clip_rect(clip_rect);
+            let text_rect =
+                egui::Rect::from_min_max(egui::pos2(72.0, 260.0), egui::pos2(2_000.0, 306.0));
+
+            let interaction_rect = large_text_selection_interaction_rect(ui, text_rect);
+            let guard = scrollbar_interaction_guard_width(ui);
+
+            assert_eq!(interaction_rect.bottom(), clip_rect.bottom() - guard);
+            assert!(!interaction_rect.contains(egui::pos2(100.0, clip_rect.bottom() - 1.0)));
+            assert!(interaction_rect.contains(egui::pos2(100.0, clip_rect.bottom() - guard - 1.0)));
+        });
+    }
+
+    #[test]
     fn positioned_row_ui_does_not_advance_parent_layout() {
         egui::__run_test_ui(|ui| {
             ui.set_height(100.0);
@@ -4155,14 +5407,6 @@ mod tests {
         assert!(line_height_extras.is_empty());
         assert!(measured_lines.is_empty());
         assert_eq!(cached_line_range, Some(10..20));
-    }
-
-    #[test]
-    fn first_missing_visible_line_finds_missing_tail_rows() {
-        let missing_line = first_missing_visible_line(8..14, |line_index| line_index < 11);
-
-        assert_eq!(missing_line, Some(11));
-        assert_eq!(first_missing_visible_line(8..11, |_| true), None);
     }
 
     #[test]

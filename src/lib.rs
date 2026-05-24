@@ -1,5 +1,5 @@
 use memchr::memchr_iter;
-use memmap2::MmapOptions;
+use memmap2::{Mmap, MmapOptions};
 use std::borrow::Cow;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
@@ -16,8 +16,12 @@ use std::os::unix::fs::MetadataExt;
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 
-pub const DEFAULT_MAX_INLINE_EDIT_BYTES: u64 = 16 * BYTES_PER_MIB;
+pub const LARGE_FILE_MMAP_THRESHOLD_BYTES: u64 = 50 * BYTES_PER_MIB;
+pub const DEFAULT_MAX_INLINE_EDIT_BYTES: u64 = LARGE_FILE_MMAP_THRESHOLD_BYTES;
 pub const DEFAULT_LARGE_VIEW_BYTES: usize = 1024 * 1024;
+pub const UTF8_DETECTION_LIMIT_BYTES: usize = 4096;
+pub const COMPACT_ENCODING_DETECTION_LIMIT_BYTES: usize = 65_536;
+pub const LINE_ENDING_DETECTION_LIMIT_BYTES: usize = 4096;
 const LINE_INDEX_SCAN_BUFFER_BYTES: usize = 1024 * 1024;
 const LINE_INDEX_CHUNK_LINES: usize = 1024;
 const LINE_START_SCAN_BUFFER_BYTES: usize = 64 * 1024;
@@ -92,7 +96,7 @@ pub enum DocumentOpenMode {
     Large,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum OpenedDocument {
     Inline(EditorDocument),
     Large(Box<LargeDocument>),
@@ -123,27 +127,29 @@ struct TextPiece {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PieceTable {
-    original: String,
-    add: String,
+    original: Arc<[u8]>,
+    add_buf: Vec<u8>,
     pieces: Vec<TextPiece>,
 }
 
 impl PieceTable {
     #[must_use]
     pub fn from_original(original: String) -> Self {
-        let pieces = if original.is_empty() {
+        let original_bytes = original.into_bytes();
+        let original_len = original_bytes.len();
+        let pieces = if original_len == 0 {
             Vec::new()
         } else {
             vec![TextPiece {
                 source: PieceSource::Original,
                 start: 0,
-                len: original.len(),
+                len: original_len,
             }]
         };
 
         Self {
-            original,
-            add: String::new(),
+            original: Arc::from(original_bytes),
+            add_buf: Vec::new(),
             pieces,
         }
     }
@@ -160,13 +166,13 @@ impl PieceTable {
 
     #[must_use]
     pub fn text(&self) -> String {
-        let mut text = String::with_capacity(self.len());
+        let mut text = Vec::with_capacity(self.len());
 
         for piece in &self.pieces {
-            text.push_str(self.piece_text(piece));
+            text.extend_from_slice(self.piece_text(piece));
         }
 
-        text
+        String::from_utf8(text).expect("piece table should preserve valid UTF-8 boundaries")
     }
 
     pub fn replace_range(&mut self, range: Range<usize>, replacement: &str) -> io::Result<()> {
@@ -240,10 +246,10 @@ impl PieceTable {
         Ok(())
     }
 
-    fn piece_text(&self, piece: &TextPiece) -> &str {
+    fn piece_text(&self, piece: &TextPiece) -> &[u8] {
         let source = match piece.source {
-            PieceSource::Original => &self.original,
-            PieceSource::Add => &self.add,
+            PieceSource::Original => self.original.as_ref(),
+            PieceSource::Add => self.add_buf.as_slice(),
         };
 
         &source[piece.start..piece.start + piece.len]
@@ -254,8 +260,8 @@ impl PieceTable {
             return None;
         }
 
-        let start = self.add.len();
-        self.add.push_str(replacement);
+        let start = self.add_buf.len();
+        self.add_buf.extend_from_slice(replacement.as_bytes());
 
         Some(TextPiece {
             source: PieceSource::Add,
@@ -448,6 +454,22 @@ impl LargeFileLineIndex {
         scan_line_start_from_checkpoint(path.as_ref(), checkpoint, line_index)
     }
 
+    pub fn line_start_byte_in_mmap(
+        &self,
+        mmap: &[u8],
+        line_index: usize,
+    ) -> io::Result<Option<u64>> {
+        if line_index >= self.line_count {
+            return Ok(None);
+        }
+
+        let checkpoint = self
+            .checkpoint_for_line(line_index)
+            .expect("line index should always contain the first checkpoint");
+
+        scan_line_start_from_checkpoint_bytes(mmap, checkpoint, line_index)
+    }
+
     pub fn line_end_byte(
         &self,
         path: impl AsRef<Path>,
@@ -464,6 +486,40 @@ impl LargeFileLineIndex {
         }
     }
 
+    pub fn line_end_byte_in_mmap(&self, mmap: &[u8], line_index: usize) -> io::Result<Option<u64>> {
+        if line_index >= self.line_count {
+            return Ok(None);
+        }
+
+        if line_index + 1 < self.line_count {
+            self.line_start_byte_in_mmap(mmap, line_index + 1)
+        } else {
+            Ok(Some(self.bytes))
+        }
+    }
+
+    pub fn line_text_byte_range_in_mmap(
+        &self,
+        mmap: &[u8],
+        line_index: usize,
+    ) -> io::Result<Option<Range<u64>>> {
+        if line_index >= self.line_count {
+            return Ok(None);
+        }
+
+        let checkpoint = self
+            .checkpoint_for_line(line_index)
+            .expect("line index should always contain the first checkpoint");
+
+        scan_line_text_range_from_checkpoint_bytes(
+            mmap,
+            checkpoint,
+            line_index,
+            self.line_count,
+            self.bytes,
+        )
+    }
+
     pub fn line_at_or_before(&self, path: impl AsRef<Path>, byte_offset: u64) -> io::Result<usize> {
         let byte_offset = byte_offset.min(self.bytes);
         let checkpoint = self
@@ -471,6 +527,15 @@ impl LargeFileLineIndex {
             .expect("line index should always contain the first checkpoint");
 
         scan_line_at_or_before_from_checkpoint(path.as_ref(), checkpoint, byte_offset)
+    }
+
+    pub fn line_at_or_before_in_mmap(&self, mmap: &[u8], byte_offset: u64) -> io::Result<usize> {
+        let byte_offset = byte_offset.min(self.bytes);
+        let checkpoint = self
+            .checkpoint_for_byte(byte_offset)
+            .expect("line index should always contain the first checkpoint");
+
+        scan_line_at_or_before_from_checkpoint_bytes(mmap, checkpoint, byte_offset)
     }
 
     #[must_use]
@@ -629,6 +694,143 @@ fn scan_line_at_or_before_from_checkpoint(
     }
 }
 
+fn scan_line_start_from_checkpoint_bytes(
+    bytes: &[u8],
+    checkpoint: &FileLineIndexCheckpoint,
+    target_line: usize,
+) -> io::Result<Option<u64>> {
+    if target_line == checkpoint.line_index {
+        return Ok(Some(checkpoint.byte_offset));
+    }
+
+    let start = usize::try_from(checkpoint.byte_offset).map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            "line checkpoint byte offset does not fit in memory address space",
+        )
+    })?;
+    let Some(slice) = bytes.get(start..) else {
+        return Ok(None);
+    };
+
+    let mut current_line = checkpoint.line_index;
+
+    for newline_index in memchr_iter(b'\n', slice) {
+        current_line += 1;
+        let line_start = checkpoint.byte_offset + newline_index as u64 + 1;
+
+        if current_line == target_line {
+            return Ok(Some(line_start));
+        }
+
+        if current_line > target_line {
+            break;
+        }
+    }
+
+    Ok(None)
+}
+
+fn scan_line_text_range_from_checkpoint_bytes(
+    bytes: &[u8],
+    checkpoint: &FileLineIndexCheckpoint,
+    target_line: usize,
+    line_count: usize,
+    file_bytes: u64,
+) -> io::Result<Option<Range<u64>>> {
+    let checkpoint_start = usize::try_from(checkpoint.byte_offset).map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            "line checkpoint byte offset does not fit in memory address space",
+        )
+    })?;
+    let Some(checkpoint_slice) = bytes.get(checkpoint_start..) else {
+        return Ok(None);
+    };
+
+    let mut current_line = checkpoint.line_index;
+    let mut line_start = checkpoint.byte_offset;
+
+    if target_line != current_line {
+        let mut found = false;
+
+        for newline_index in memchr_iter(b'\n', checkpoint_slice) {
+            current_line += 1;
+            line_start = checkpoint.byte_offset + newline_index as u64 + 1;
+
+            if current_line == target_line {
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            return Ok(None);
+        }
+    }
+
+    let start = usize::try_from(line_start).map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            "line start byte offset does not fit in memory address space",
+        )
+    })?;
+    let Some(line_slice) = bytes.get(start..) else {
+        return Ok(None);
+    };
+
+    let line_end = if target_line + 1 < line_count {
+        memchr_iter(b'\n', line_slice)
+            .next()
+            .map(|newline_index| line_start + newline_index as u64 + 1)
+            .unwrap_or(file_bytes)
+    } else {
+        file_bytes
+    };
+
+    Ok(Some(line_start..line_end))
+}
+
+fn scan_line_at_or_before_from_checkpoint_bytes(
+    bytes: &[u8],
+    checkpoint: &FileLineIndexCheckpoint,
+    byte_offset: u64,
+) -> io::Result<usize> {
+    if byte_offset <= checkpoint.byte_offset {
+        return Ok(checkpoint.line_index);
+    }
+
+    let start = usize::try_from(checkpoint.byte_offset).map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            "line checkpoint byte offset does not fit in memory address space",
+        )
+    })?;
+    let end = usize::try_from(byte_offset).map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            "line target byte offset does not fit in memory address space",
+        )
+    })?;
+    let Some(slice) = bytes.get(start..end.min(bytes.len())) else {
+        return Ok(checkpoint.line_index);
+    };
+
+    let mut current_line = checkpoint.line_index;
+
+    for newline_index in memchr_iter(b'\n', slice) {
+        let next_line_start = checkpoint.byte_offset + newline_index as u64 + 1;
+
+        if next_line_start <= byte_offset {
+            current_line += 1;
+        } else {
+            break;
+        }
+    }
+
+    Ok(current_line)
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LargeViewport {
     start_byte: u64,
@@ -639,6 +841,10 @@ pub struct LargeViewport {
     leading_partial_line: bool,
     trailing_partial_line: bool,
     include_trailing_empty_line: bool,
+    /// Maximum number of Unicode scalar values across all lines of `text`,
+    /// pre-computed at construction so the editor does not have to re-scan a
+    /// ~1 MiB viewport for content-width every frame.
+    longest_line_chars: usize,
 }
 
 impl LargeViewport {
@@ -651,6 +857,7 @@ impl LargeViewport {
         trailing_partial_line: bool,
         include_trailing_empty_line: bool,
     ) -> Self {
+        let longest_line_chars = max_line_char_count(&text);
         Self {
             start_byte,
             end_byte,
@@ -662,8 +869,14 @@ impl LargeViewport {
             leading_partial_line,
             trailing_partial_line,
             include_trailing_empty_line,
+            longest_line_chars,
             text,
         }
+    }
+
+    #[must_use]
+    pub fn longest_line_chars(&self) -> usize {
+        self.longest_line_chars
     }
 
     #[must_use]
@@ -750,6 +963,7 @@ impl LargeViewport {
 
         self.piece_table = None;
         self.line_index = ChunkedLineIndex::from_text(&text);
+        self.longest_line_chars = max_line_char_count(&text);
         self.text = text;
         self.leading_partial_line = false;
         self.trailing_partial_line = false;
@@ -768,10 +982,22 @@ impl LargeViewport {
             &self.text,
             self.include_trailing_empty_line,
         );
+        self.longest_line_chars = max_line_char_count(&self.text);
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[inline]
+fn max_line_char_count(text: &str) -> usize {
+    text.split('\n')
+        .map(|line| {
+            let trimmed = line.strip_suffix('\r').unwrap_or(line);
+            trimmed.chars().count()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+#[derive(Debug, Clone)]
 pub struct LargeDocument {
     path: PathBuf,
     bytes: u64,
@@ -781,6 +1007,11 @@ pub struct LargeDocument {
     line_index: LargeFileLineIndex,
     viewport_start_line: usize,
     dirty: bool,
+    /// Persistent read-only memory map of the file. Held for the lifetime of
+    /// the document so viewport reloads and per-line text reads can be served
+    /// without re-opening the file, re-allocating the mapping, or blocking on
+    /// background threads.
+    mmap: Arc<Mmap>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -814,6 +1045,23 @@ impl LargeDocument {
         self.viewport.text()
     }
 
+    pub fn full_text_from_mmap(&self) -> io::Result<&str> {
+        let end = usize::try_from(self.bytes).map_err(|_| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                "file size does not fit in memory address space",
+            )
+        })?;
+        let bytes = self.mmap.get(0..end).ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "mapped file is shorter than the recorded file size",
+            )
+        })?;
+
+        std::str::from_utf8(bytes).map_err(|error| io::Error::new(ErrorKind::InvalidData, error))
+    }
+
     #[must_use]
     pub fn is_dirty(&self) -> bool {
         self.dirty
@@ -831,6 +1079,11 @@ impl LargeDocument {
     #[must_use]
     pub fn viewport_line_count(&self) -> usize {
         self.viewport.line_count()
+    }
+
+    #[must_use]
+    pub fn viewport_longest_line_chars(&self) -> usize {
+        self.viewport.longest_line_chars()
     }
 
     #[must_use]
@@ -889,6 +1142,65 @@ impl LargeDocument {
         self.viewport_line_text(viewport_line)
     }
 
+    pub fn file_line_text_from_mmap(&self, line_index: usize) -> io::Result<Option<&str>> {
+        if line_index >= self.file_line_count() {
+            return Ok(None);
+        }
+
+        let Some(range) = self
+            .line_index
+            .line_text_byte_range_in_mmap(&self.mmap, line_index)?
+        else {
+            return Ok(None);
+        };
+
+        let start = usize::try_from(range.start).map_err(|_| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                "line start byte offset does not fit in memory address space",
+            )
+        })?;
+        let mut end = usize::try_from(range.end).map_err(|_| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                "line end byte offset does not fit in memory address space",
+            )
+        })?;
+        let bytes = self.mmap.get(start..end).ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "line byte range extends past the mapped file",
+            )
+        })?;
+
+        if end > start && bytes.last() == Some(&b'\n') {
+            end -= 1;
+            if end > start && self.mmap.get(end - 1) == Some(&b'\r') {
+                end -= 1;
+            }
+        }
+
+        let bytes = self.mmap.get(start..end).ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "trimmed line byte range extends past the mapped file",
+            )
+        })?;
+
+        std::str::from_utf8(bytes)
+            .map(Some)
+            .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))
+    }
+
+    #[must_use]
+    pub fn display_line_text(&self, line_index: usize) -> Option<&str> {
+        if self.dirty {
+            self.file_line_text(line_index)
+        } else {
+            self.file_line_text_from_mmap(line_index).ok().flatten()
+        }
+    }
+
     #[must_use]
     pub fn is_file_line_editable(&self, line_index: usize) -> bool {
         let Some(viewport_line) = line_index.checked_sub(self.viewport_start_line) else {
@@ -944,12 +1256,12 @@ impl LargeDocument {
         }
 
         ensure_file_fingerprint_matches(&self.path, &self.fingerprint)?;
-        let viewport = read_large_viewport(&self.path, start_byte, self.viewport_bytes)?;
-        ensure_file_fingerprint_matches(&self.path, &self.fingerprint)?;
+        let viewport =
+            read_large_viewport_from_mmap(&self.mmap, self.bytes, start_byte, self.viewport_bytes)?;
 
         let viewport_start_line = self
             .line_index
-            .line_at_or_before(&self.path, viewport.start_byte())?;
+            .line_at_or_before_in_mmap(&self.mmap, viewport.start_byte())?;
 
         self.viewport = viewport;
         self.viewport_start_line = viewport_start_line;
@@ -967,7 +1279,7 @@ impl LargeDocument {
         let clamped_line = line_index.min(self.file_line_count().saturating_sub(1));
         let start_byte = self
             .line_index
-            .line_start_byte(&self.path, clamped_line)?
+            .line_start_byte_in_mmap(&self.mmap, clamped_line)?
             .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "line is outside the file"))?;
 
         self.load_viewport_at(start_byte)
@@ -991,14 +1303,16 @@ impl LargeDocument {
         self.fingerprint = file_fingerprint(&self.path)?;
         self.bytes = self.fingerprint.len;
         self.line_index = LargeFileLineIndex::from_path(&self.path)?;
-        self.viewport = read_large_viewport(
-            &self.path,
+        self.mmap = Arc::new(map_path(&self.path)?);
+        self.viewport = read_large_viewport_from_mmap(
+            &self.mmap,
+            self.bytes,
             self.viewport.start_byte.min(self.bytes),
             self.viewport_bytes,
         )?;
         self.viewport_start_line = self
             .line_index
-            .line_at_or_before(&self.path, self.viewport.start_byte())?;
+            .line_at_or_before_in_mmap(&self.mmap, self.viewport.start_byte())?;
         self.dirty = false;
         Ok(())
     }
@@ -1168,7 +1482,11 @@ pub fn count_visual_lines(text: &str) -> usize {
 
 #[must_use]
 pub fn detect_line_ending(text: &str) -> Option<LineEnding> {
-    let bytes = text.as_bytes();
+    detect_line_ending_bytes(text.as_bytes())
+}
+
+fn detect_line_ending_bytes(bytes: &[u8]) -> Option<LineEnding> {
+    let bytes = &bytes[..bytes.len().min(LINE_ENDING_DETECTION_LIMIT_BYTES)];
     let mut index = 0;
 
     while index < bytes.len() {
@@ -1249,12 +1567,13 @@ pub fn profile_text_file(path: impl AsRef<Path>) -> io::Result<FileProfile> {
     }
 
     let mapped_file = map_file(&file)?;
+    let utf8_sample = &mapped_file[..mapped_file.len().min(UTF8_DETECTION_LIMIT_BYTES)];
 
     Ok(FileProfile {
         path: document_path,
         bytes,
         visual_lines: memchr_iter(b'\n', &mapped_file).count() + 1,
-        is_utf8: std::str::from_utf8(&mapped_file).is_ok(),
+        is_utf8: looks_like_utf8_prefix(utf8_sample),
     })
 }
 
@@ -1294,8 +1613,7 @@ pub fn load_document_with_limit(
     max_inline_edit_bytes: u64,
 ) -> io::Result<EditorDocument> {
     let document_path = path.as_ref().to_path_buf();
-    let file = File::open(&document_path)?;
-    let bytes = file.metadata()?.len();
+    let bytes = fs::metadata(&document_path)?.len();
 
     if !can_inline_edit(bytes, max_inline_edit_bytes) {
         return Err(io::Error::new(
@@ -1311,7 +1629,11 @@ pub fn load_document_with_limit(
         ));
     }
 
-    let (text, encoding) = read_mapped_text(&file)?;
+    let raw_bytes = fs::read(&document_path)?;
+    let (text_bytes, encoding) = decode_utf8_bytes(&raw_bytes);
+    let text = std::str::from_utf8(text_bytes)
+        .map(str::to_owned)
+        .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
 
     Ok(EditorDocument::from_saved_text_with_format(
         document_path,
@@ -1332,10 +1654,10 @@ pub fn open_large_document_with_viewport(
     let fingerprint = file_fingerprint(&document_path)?;
     let bytes = fingerprint.len;
     let line_index = LargeFileLineIndex::from_path(&document_path)?;
-    let viewport = read_large_viewport(&document_path, 0, viewport_bytes)?;
+    let mmap = Arc::new(map_path(&document_path)?);
+    let viewport = read_large_viewport_from_mmap(&mmap, bytes, 0, viewport_bytes)?;
     ensure_file_fingerprint_matches(&document_path, &fingerprint)?;
-    let viewport_start_line =
-        line_index.line_at_or_before(&document_path, viewport.start_byte())?;
+    let viewport_start_line = line_index.line_at_or_before_in_mmap(&mmap, viewport.start_byte())?;
 
     Ok(LargeDocument {
         path: document_path,
@@ -1346,6 +1668,7 @@ pub fn open_large_document_with_viewport(
         line_index,
         viewport_start_line,
         dirty: false,
+        mmap,
     })
 }
 
@@ -1458,25 +1781,18 @@ fn ensure_file_fingerprint_matches(path: &Path, expected: &FileFingerprint) -> i
     }
 }
 
-fn read_mapped_text(file: &File) -> io::Result<(String, TextEncoding)> {
-    if file.metadata()?.len() == 0 {
-        return Ok((String::new(), TextEncoding::Utf8));
-    }
-
-    let mapped_file = map_file(file)?;
-    let (bytes, encoding) = decode_utf8_bytes(&mapped_file);
-
-    std::str::from_utf8(bytes)
-        .map(str::to_owned)
-        .map(|text| (text, encoding))
-        .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))
-}
-
 fn decode_utf8_bytes(bytes: &[u8]) -> (&[u8], TextEncoding) {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         (&bytes[3..], TextEncoding::Utf8Bom)
     } else {
         (bytes, TextEncoding::Utf8)
+    }
+}
+
+fn looks_like_utf8_prefix(bytes: &[u8]) -> bool {
+    match std::str::from_utf8(bytes) {
+        Ok(_) => true,
+        Err(error) => error.error_len().is_none(),
     }
 }
 
@@ -1487,6 +1803,83 @@ fn map_file(file: &File) -> io::Result<memmap2::Mmap> {
     };
 
     Ok(mapped_file)
+}
+
+fn map_path(path: &Path) -> io::Result<Mmap> {
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        // memmap2 refuses to map zero-length files. Build a one-byte
+        // anonymous, read-only map that we never index into.
+        return MmapOptions::new()
+            .len(1)
+            .map_anon()
+            .and_then(|m| m.make_read_only());
+    }
+    map_file(&file)
+}
+
+/// Read a viewport-sized slice from a memory-mapped file without re-opening the
+/// file. UTF-8 boundaries are respected at both ends and leading/trailing
+/// partial-line flags are populated identically to [`read_large_viewport`].
+fn read_large_viewport_from_mmap(
+    mmap: &Mmap,
+    total_bytes: u64,
+    start_byte: u64,
+    max_bytes: usize,
+) -> io::Result<LargeViewport> {
+    let start_byte = start_byte.min(total_bytes);
+    let read_start = start_byte.saturating_sub(3);
+    let prefix_bytes = (start_byte - read_start) as usize;
+    let bytes_to_read =
+        (total_bytes - read_start).min((max_bytes + prefix_bytes + 3) as u64) as usize;
+
+    if bytes_to_read == 0 {
+        return Ok(LargeViewport::from_text(
+            start_byte,
+            start_byte,
+            String::new(),
+            false,
+            false,
+            true,
+        ));
+    }
+
+    let buffer = mmap
+        .get(read_start as usize..(read_start as usize + bytes_to_read))
+        .ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "viewport window extends past the mapped file",
+            )
+        })?;
+
+    let start_offset = utf8_boundary_at_or_before(buffer, prefix_bytes);
+    let viewport_start = read_start + start_offset as u64;
+    let leading_partial_line = viewport_start > 0
+        && previous_byte_from_mmap(mmap, viewport_start.saturating_sub(1)) != Some(b'\n');
+    let available_bytes = &buffer[start_offset..];
+    let candidate_len = available_bytes.len().min(max_bytes);
+    let safe_len = utf8_safe_prefix_len(&available_bytes[..candidate_len])?;
+    let text = std::str::from_utf8(&available_bytes[..safe_len])
+        .map(str::to_owned)
+        .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
+    let end_byte = viewport_start + safe_len as u64;
+    let trailing_partial_line = end_byte < total_bytes && !text.as_bytes().ends_with(b"\n");
+    let include_trailing_empty_line = end_byte == total_bytes || !text.as_bytes().ends_with(b"\n");
+
+    Ok(LargeViewport::from_text(
+        viewport_start,
+        end_byte,
+        text,
+        leading_partial_line,
+        trailing_partial_line,
+        include_trailing_empty_line,
+    ))
+}
+
+fn previous_byte_from_mmap(mmap: &Mmap, byte_offset: u64) -> Option<u8> {
+    mmap.get(byte_offset as usize).copied()
 }
 
 fn read_mapped_window_or_file(file: &mut File, offset: u64, len: usize) -> io::Result<Vec<u8>> {
@@ -1791,6 +2184,13 @@ mod tests {
     }
 
     #[test]
+    fn detects_line_endings_only_in_initial_sample() {
+        let text = format!("{}\r\nlater", "a".repeat(LINE_ENDING_DETECTION_LIMIT_BYTES));
+
+        assert_eq!(detect_line_ending(&text), None);
+    }
+
+    #[test]
     fn normalizes_line_endings_to_document_style() {
         let normalized = normalize_line_endings("a\nb\r\nc\r", LineEnding::Crlf);
 
@@ -1873,6 +2273,19 @@ mod tests {
         piece_table.replace_range(piece_table.len()..piece_table.len(), " end")?;
 
         assert_eq!(piece_table.text(), "start alpha BETA gamma end");
+
+        Ok(())
+    }
+
+    #[test]
+    fn piece_table_keeps_original_immutable_and_additions_as_bytes() -> io::Result<()> {
+        let mut piece_table = PieceTable::from_original("alpha beta".to_owned());
+
+        piece_table.replace_range(6..10, "βeta")?;
+
+        assert_eq!(piece_table.original.as_ref(), b"alpha beta");
+        assert_eq!(piece_table.add_buf, "βeta".as_bytes());
+        assert_eq!(piece_table.text(), "alpha βeta");
 
         Ok(())
     }
@@ -1979,6 +2392,21 @@ mod tests {
     }
 
     #[test]
+    fn profile_text_file_limits_utf8_detection_to_initial_sample() -> io::Result<()> {
+        let path = unique_temp_path("profile_utf8_sample.txt");
+        let mut bytes = vec![b'a'; UTF8_DETECTION_LIMIT_BYTES];
+        bytes.push(0xff);
+        fs::write(&path, bytes)?;
+
+        let profile = profile_text_file(&path)?;
+
+        assert!(profile.is_utf8);
+
+        fs::remove_file(profile.path)?;
+        Ok(())
+    }
+
+    #[test]
     fn load_document_handles_empty_files() -> io::Result<()> {
         let path = unique_temp_path("empty.txt");
         fs::write(&path, "")?;
@@ -2009,6 +2437,15 @@ mod tests {
             DEFAULT_MAX_INLINE_EDIT_BYTES,
             DEFAULT_MAX_INLINE_EDIT_BYTES,
         ));
+    }
+
+    #[test]
+    fn default_inline_limit_matches_large_file_mmap_threshold() {
+        assert_eq!(
+            DEFAULT_MAX_INLINE_EDIT_BYTES,
+            LARGE_FILE_MMAP_THRESHOLD_BYTES
+        );
+        assert_eq!(DEFAULT_MAX_INLINE_EDIT_BYTES, 50 * BYTES_PER_MIB);
     }
 
     #[test]
@@ -2309,6 +2746,88 @@ mod tests {
             .expect_err("invalid UTF-8 should not be converted lossily");
 
         assert_eq!(error.kind(), ErrorKind::InvalidData);
+
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn large_viewport_caches_longest_line_chars() -> io::Result<()> {
+        let path = unique_temp_path("longest_line_cache.txt");
+        fs::write(&path, "ab\nαβγδε\nx\n")?;
+        let document = open_large_document_with_viewport(&path, 64)?;
+
+        assert_eq!(document.viewport_longest_line_chars(), 5);
+
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn large_viewport_reload_is_sync_and_mmap_backed() -> io::Result<()> {
+        let path = unique_temp_path("sync_mmap_reload.txt");
+        let mut payload = String::new();
+        for n in 0..2_000 {
+            payload.push_str(&format!("line {n:04}\n"));
+        }
+        fs::write(&path, payload.as_bytes())?;
+
+        let mut document = open_large_document_with_viewport(&path, 256)?;
+        let initial_start = document.viewport_start_line();
+
+        document.load_viewport_for_line(1_500)?;
+        assert!(document.viewport_start_line() > initial_start);
+        assert!(document.contains_file_line(1_500));
+
+        document.load_viewport_for_line(50)?;
+        assert!(document.contains_file_line(50));
+        assert!(!document.contains_file_line(1_500));
+
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mmap_line_index_lookup_matches_file_backed_scan() -> io::Result<()> {
+        let path = unique_temp_path("mmap_line_lookup.txt");
+        let mut payload = String::new();
+        for n in 0..3_000 {
+            payload.push_str(&format!("line-{n:04}-{}\n", "x".repeat(n % 17)));
+        }
+        fs::write(&path, payload.as_bytes())?;
+
+        let line_index = LargeFileLineIndex::from_path(&path)?;
+        let mmap = map_path(&path)?;
+        for line in [0, 1, 17, 1_023, 1_024, 2_047, 2_999] {
+            assert_eq!(
+                line_index.line_start_byte(&path, line)?,
+                line_index.line_start_byte_in_mmap(&mmap, line)?
+            );
+        }
+        for byte_offset in [0, 7, 128, 4_096, 16_384, payload.len() as u64] {
+            assert_eq!(
+                line_index.line_at_or_before(&path, byte_offset)?,
+                line_index.line_at_or_before_in_mmap(&mmap, byte_offset)?
+            );
+        }
+
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn display_line_text_reads_clean_lines_outside_active_viewport() -> io::Result<()> {
+        let path = unique_temp_path("direct_display_line.txt");
+        let mut payload = String::new();
+        for n in 0..3_000 {
+            payload.push_str(&format!("line-{n:04}\r\n"));
+        }
+        fs::write(&path, payload.as_bytes())?;
+
+        let document = open_large_document_with_viewport(&path, 128)?;
+        assert!(document.contains_file_line(0));
+        assert!(!document.contains_file_line(2_999));
+        assert_eq!(document.display_line_text(2_999), Some("line-2999"));
 
         fs::remove_file(path)?;
         Ok(())

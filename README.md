@@ -4,7 +4,7 @@
 
 This milestone separates normal inline editing from a large-file engine. Small UTF-8 files open as regular editable buffers. Files above the inline threshold open in a viewport mode that reads only a small window of the file, avoiding full-file `String` allocation and keeping startup responsive for 100GB-class files.
 
-The current inline editor accepts UTF-8 files up to 16 MiB. Larger files open asynchronously in large-file viewport mode with a 1 MiB editable window plus a sparse whole-file line index. The editor renders the full file line count as virtual rows, then loads the byte window needed for the visible rows on demand. The sparse index keeps periodic line checkpoints instead of every line offset, and is built by streaming fixed-size chunks instead of memory-mapping the entire file. The active window keeps a local chunked line index, and only allocates a piece table after the first viewport edit, so opening a large file does not duplicate the viewport text for editing state. Rows that cross viewport boundaries are kept read-only to avoid saving accidental partial-line edits. Saving a changed viewport runs in the background and streams the original file into a replacement file while substituting only the visible byte range.
+The current inline editor accepts UTF-8 files up to 50 MiB. Larger files open asynchronously in large-file viewport mode with a 1 MiB editable window plus a sparse whole-file line index. The editor renders the full file line count as virtual rows, then loads the byte window needed for the visible rows on demand. The sparse index keeps periodic line checkpoints instead of every line offset, and is built by streaming fixed-size chunks instead of memory-mapping the entire file. The active window keeps a local chunked line index, and only allocates a byte-backed piece table after the first viewport edit, so opening a large file does not duplicate the viewport text for editing state. Rows that cross viewport boundaries are kept read-only to avoid saving accidental partial-line edits. Saving a changed viewport runs in the background and streams the original file into a replacement file while substituting only the visible byte range.
 
 ## Requirements
 
@@ -36,8 +36,10 @@ cargo test
 - Scroll across every indexed line in a large file instead of stopping at the first viewport.
 - Horizontally scroll long editor lines, with an optional wrap mode from the View menu.
 - Search with match-case, whole-word, and regular-expression options; Replace All is available for inline documents.
+- Reuse compiled regular expressions for repeated search execution and visible-range search highlighting.
 - Highlight string and regular-expression search matches in the editor surface.
 - Highlight syntax tokens, matching brackets, selected words, and multi-selection ranges.
+- Limit automatic selected-word highlighting to single-line selections of at most 200 bytes.
 - Use multi-cursor and multi-selection commands for repeated occurrences and selected line ranges in inline documents.
 - Create rectangular selections, copy rectangular slices, and paste them back across multiple lines.
 - Move, copy, and delete selected lines from menu commands or keyboard shortcuts.

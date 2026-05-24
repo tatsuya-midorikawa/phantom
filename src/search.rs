@@ -14,6 +14,7 @@ pub struct SearchOptions {
 pub struct TextSearchMatch {
     pub range: std::ops::Range<usize>,
     pub line_index: usize,
+    pub line_start: usize,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -33,40 +34,102 @@ impl std::fmt::Display for SearchError {
 
 impl std::error::Error for SearchError {}
 
+#[derive(Debug, Clone)]
+pub struct CompiledSearch {
+    options: SearchOptions,
+    regex: Regex,
+}
+
+impl CompiledSearch {
+    pub fn new(query: &str, options: SearchOptions) -> Result<Self, SearchError> {
+        Ok(Self {
+            options,
+            regex: build_search_regex(query, options)?,
+        })
+    }
+
+    #[must_use]
+    pub fn find_matches(&self, text: &str, limit: usize) -> Vec<TextSearchMatch> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let mut line_tracker = LineTracker::new(text);
+        let mut matches = Vec::new();
+
+        for regex_match in self.regex.find_iter(text) {
+            if regex_match.is_empty() {
+                continue;
+            }
+
+            let range = regex_match.start()..regex_match.end();
+
+            if self.options.whole_word && !is_whole_word_match(text, range.clone()) {
+                continue;
+            }
+
+            let (line_index, line_start) = line_tracker.line_at(range.start);
+            matches.push(TextSearchMatch {
+                range,
+                line_index,
+                line_start,
+            });
+
+            if matches.len() >= limit {
+                break;
+            }
+        }
+
+        matches
+    }
+
+    #[must_use]
+    pub fn replace_all(&self, text: &str, replacement: &str) -> (String, usize) {
+        let mut replaced = String::with_capacity(text.len());
+        let mut last_end = 0;
+        let mut count = 0;
+
+        for captures in self.regex.captures_iter(text) {
+            let Some(regex_match) = captures.get(0) else {
+                continue;
+            };
+
+            if regex_match.is_empty() {
+                continue;
+            }
+
+            let range = regex_match.start()..regex_match.end();
+
+            if self.options.whole_word && !is_whole_word_match(text, range.clone()) {
+                continue;
+            }
+
+            replaced.push_str(&text[last_end..range.start]);
+            if self.options.use_regex {
+                captures.expand(replacement, &mut replaced);
+            } else {
+                replaced.push_str(replacement);
+            }
+            last_end = range.end;
+            count += 1;
+        }
+
+        if count == 0 {
+            return (text.to_owned(), 0);
+        }
+
+        replaced.push_str(&text[last_end..]);
+        (replaced, count)
+    }
+}
+
 pub fn find_text_matches(
     text: &str,
     query: &str,
     options: SearchOptions,
     limit: usize,
 ) -> Result<Vec<TextSearchMatch>, SearchError> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-
-    let regex = build_search_regex(query, options)?;
-    let mut line_tracker = LineTracker::new(text);
-    let mut matches = Vec::new();
-
-    for regex_match in regex.find_iter(text) {
-        if regex_match.is_empty() {
-            continue;
-        }
-
-        let range = regex_match.start()..regex_match.end();
-
-        if options.whole_word && !is_whole_word_match(text, range.clone()) {
-            continue;
-        }
-
-        let line_index = line_tracker.line_index_at(range.start);
-        matches.push(TextSearchMatch { range, line_index });
-
-        if matches.len() >= limit {
-            break;
-        }
-    }
-
-    Ok(matches)
+    Ok(CompiledSearch::new(query, options)?.find_matches(text, limit))
 }
 
 pub fn replace_all(
@@ -75,42 +138,7 @@ pub fn replace_all(
     replacement: &str,
     options: SearchOptions,
 ) -> Result<(String, usize), SearchError> {
-    let regex = build_search_regex(query, options)?;
-    let mut replaced = String::with_capacity(text.len());
-    let mut last_end = 0;
-    let mut count = 0;
-
-    for captures in regex.captures_iter(text) {
-        let Some(regex_match) = captures.get(0) else {
-            continue;
-        };
-
-        if regex_match.is_empty() {
-            continue;
-        }
-
-        let range = regex_match.start()..regex_match.end();
-
-        if options.whole_word && !is_whole_word_match(text, range.clone()) {
-            continue;
-        }
-
-        replaced.push_str(&text[last_end..range.start]);
-        if options.use_regex {
-            captures.expand(replacement, &mut replaced);
-        } else {
-            replaced.push_str(replacement);
-        }
-        last_end = range.end;
-        count += 1;
-    }
-
-    if count == 0 {
-        return Ok((text.to_owned(), 0));
-    }
-
-    replaced.push_str(&text[last_end..]);
-    Ok((replaced, count))
+    Ok(CompiledSearch::new(query, options)?.replace_all(text, replacement))
 }
 
 pub fn line_preview(text: &str, byte_index: usize) -> String {
@@ -201,6 +229,7 @@ fn is_word_char(character: char) -> bool {
 struct LineTracker<'a> {
     newline_offsets: memchr::Memchr<'a>,
     line_index: usize,
+    line_start: usize,
     next_line_start: Option<usize>,
 }
 
@@ -212,20 +241,24 @@ impl<'a> LineTracker<'a> {
         Self {
             newline_offsets,
             line_index: 0,
+            line_start: 0,
             next_line_start,
         }
     }
 
-    fn line_index_at(&mut self, byte_index: usize) -> usize {
+    fn line_at(&mut self, byte_index: usize) -> (usize, usize) {
         while self
             .next_line_start
             .is_some_and(|line_start| line_start <= byte_index)
         {
+            self.line_start = self
+                .next_line_start
+                .expect("line start should be present when advancing line tracker");
             self.line_index += 1;
             self.next_line_start = self.newline_offsets.next().map(|index| index + 1);
         }
 
-        self.line_index
+        (self.line_index, self.line_start)
     }
 }
 
@@ -240,7 +273,9 @@ mod tests {
 
         assert_eq!(matches.len(), 2);
         assert_eq!(matches[0].line_index, 0);
+        assert_eq!(matches[0].line_start, 0);
         assert_eq!(matches[1].line_index, 2);
+        assert_eq!(matches[1].line_start, "Alpha\nbeta\n".len());
     }
 
     #[test]
@@ -275,6 +310,27 @@ mod tests {
 
         assert_eq!(count, 2);
         assert_eq!(text, "1:a 2:b");
+    }
+
+    #[test]
+    fn compiled_search_reuses_pattern_for_find_and_replace() {
+        let search = CompiledSearch::new(
+            r"item_(\d)",
+            SearchOptions {
+                use_regex: true,
+                match_case: true,
+                whole_word: false,
+            },
+        )
+        .unwrap();
+
+        let matches = search.find_matches("item_1\nitem_2", 10);
+        let (text, count) = search.replace_all("item_1 item_2", "#$1");
+
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[1].line_index, 1);
+        assert_eq!(count, 2);
+        assert_eq!(text, "#1 #2");
     }
 
     #[test]
